@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { scanTopLevelImages, type ImageEntry } from '@/utils/files';
 import { saveLastDir, loadLastDir } from '@/utils/db';
 import { doubleSpreadCount, spreadOfIndex, doubleIndices } from '@/utils/paging';
 import ImageItem from '@/components/ImageItem';
+import Icon, { type IconName } from '@/components/Icon';
+import Logo from '@/components/Logo';
 import {
   DEFAULT_CONFIG,
   loadConfig,
@@ -18,15 +20,21 @@ import { resolveLang, t, type Lang } from '@/utils/i18n';
 
 type Status = 'idle' | 'loading' | 'ready' | 'error';
 
-const MODES: { key: ReaderMode; labelKey: string }[] = [
-  { key: 'scroll', labelKey: 'modeScroll' },
-  { key: 'single', labelKey: 'modeSingle' },
-  { key: 'double', labelKey: 'modeDouble' },
+const MODES: { key: ReaderMode; labelKey: string; icon: IconName }[] = [
+  { key: 'scroll', labelKey: 'modeScroll', icon: 'modeScroll' },
+  { key: 'single', labelKey: 'modeSingle', icon: 'modeSingle' },
+  { key: 'double', labelKey: 'modeDouble', icon: 'modeDouble' },
 ];
 
 const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 5;
 const clampZoom = (v: number) => Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, v));
+
+interface View {
+  s: number;
+  x: number;
+  y: number;
+}
 
 /** 计算缩放为 s 时使内容居中所需的平移量（相对 stage 内容区，原点在左上角） */
 function centeredOffset(stage: HTMLElement | null, s: number) {
@@ -38,10 +46,26 @@ function centeredOffset(stage: HTMLElement | null, s: number) {
   return { x: (w / 2) * (1 - s), y: (h / 2) * (1 - s) };
 }
 
+/** 以内容坐标 (mx,my) 为锚点缩放，避免锚点漂移 */
+function zoomAround(v: View, mx: number, my: number, factor: number): View {
+  const s = clampZoom(v.s * factor);
+  const cx = (mx - v.x) / v.s;
+  const cy = (my - v.y) / v.s;
+  return { s, x: mx - s * cx, y: my - s * cy };
+}
+
+function isTypingTarget(target: EventTarget | null) {
+  const el = target as HTMLElement | null;
+  if (!el) return false;
+  const tag = el.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
+}
+
 export default function App() {
   const [images, setImages] = useState<ImageEntry[]>([]);
   const [dirName, setDirName] = useState('');
   const [hasSubfolders, setHasSubfolders] = useState(false);
+  const [warningDismissed, setWarningDismissed] = useState(false);
   const [status, setStatus] = useState<Status>('idle');
   const [error, setError] = useState('');
 
@@ -51,8 +75,10 @@ export default function App() {
   const [currentIndex, setCurrentIndex] = useState(0);
   const [barsVisible, setBarsVisible] = useState(true);
   const [dirVisible, setDirVisible] = useState(true);
+  const [hintsOpen, setHintsOpen] = useState(false);
+  const [dirQuery, setDirQuery] = useState('');
   // 单/双页视图：s=缩放比例，x/y=平移量（相对 stage 内容区左上角，transform-origin 固定为左上角）
-  const [view, setView] = useState({ s: 1, x: 0, y: 0 });
+  const [view, setView] = useState<View>({ s: 1, x: 0, y: 0 });
   // 下拉滚动的阅读进度百分比
   const [scrollProgress, setScrollProgress] = useState(0);
 
@@ -65,11 +91,14 @@ export default function App() {
   const lastFlipRef = useRef(0);
   const clickTimerRef = useRef<number | undefined>(undefined);
   const dragRef = useRef<{ startX: number; startY: number; originX: number; originY: number } | null>(null);
+  const activeItemRef = useRef<HTMLButtonElement | null>(null);
+  // 目录跳转的校正序号：用户主动滚动/按键时递增，使未执行的校正失效
+  const jumpSeqRef = useRef(0);
 
   const spreadCount = doubleSpreadCount(images.length);
   const currentSpread = spreadOfIndex(currentIndex);
+  const hideKey = (config.hideKey || 'f').toUpperCase();
 
-  // 翻页逻辑（键盘/滚轮/点击共享；useCallback 稳定引用以配合 effect 依赖）
   const goPrev = useCallback(() => {
     if (mode === 'single') {
       setCurrentIndex((i) => Math.max(i - 1, 0));
@@ -141,11 +170,32 @@ export default function App() {
     return () => onChanged.removeListener(listener);
   }, []);
 
-  // 键盘：翻页 + 隐藏/唤回状态栏
+  // 标签页标题随语言切换
+  useEffect(() => {
+    document.title = `${t(lang, 'name')} · ${t(lang, 'reader')}`;
+  }, [lang]);
+
+  // 键盘：翻页 + 隐藏/唤回状态栏 + 快捷键面板
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
-      const hideKey = (config.hideKey || 'f').toLowerCase();
-      if (e.key.toLowerCase() === hideKey) {
+      if (e.key === 'Escape') {
+        if (hintsOpen) {
+          e.preventDefault();
+          setHintsOpen(false);
+        }
+        return;
+      }
+      // 搜索框等输入场景不拦截按键
+      if (isTypingTarget(e.target)) return;
+      if (e.key === '?') {
+        e.preventDefault();
+        setHintsOpen((v) => !v);
+        return;
+      }
+      // 快捷键面板打开时，除 Esc / ? 外不响应其它按键
+      if (hintsOpen) return;
+
+      if (e.key.toLowerCase() === (config.hideKey || 'f').toLowerCase()) {
         // 沉浸模式：隐藏状态栏时一并隐藏目录，显示时一并恢复
         const next = !barsVisible;
         setBarsVisible(next);
@@ -167,13 +217,15 @@ export default function App() {
     }
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [config.hideKey, mode, goPrev, goNext, barsVisible]);
+  }, [config.hideKey, mode, goPrev, goNext, barsVisible, hintsOpen]);
 
   // 滚轮：Ctrl+滚轮缩放（以鼠标为中心），普通滚轮翻页；原生监听支持 preventDefault
   useEffect(() => {
     const el = stageRef.current;
     if (!el) return;
     function onWheelNative(e: WheelEvent) {
+      // 用户主动滚轮时取消目录跳转的后续校正
+      jumpSeqRef.current += 1;
       if (e.ctrlKey) {
         e.preventDefault();
         const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
@@ -188,12 +240,7 @@ export default function App() {
         const cs = getComputedStyle(stageEl);
         const mx = e.clientX - (sr.left + (parseFloat(cs.paddingLeft) || 0));
         const my = e.clientY - (sr.top + (parseFloat(cs.paddingTop) || 0));
-        setView((v) => {
-          const s2 = clampZoom(v.s * factor);
-          const cx = (mx - v.x) / v.s;
-          const cy = (my - v.y) / v.s;
-          return { s: s2, x: mx - s2 * cx, y: my - s2 * cy };
-        });
+        setView((v) => zoomAround(v, mx, my, factor));
         return;
       }
       if (mode === 'scroll') return;
@@ -230,25 +277,56 @@ export default function App() {
     };
   }, []);
 
-  // 下拉滚动模式：随滚动更新当前图片索引，实现目录高亮与阅读进度双向同步
+  // 下拉滚动模式：随滚动更新当前图片索引，实现目录高亮与阅读进度双向同步。
+  // 说明：不用 IntersectionObserver（其回调只包含「变化」的条目，图片懒加载改变高度时
+  // 会漏掉真正的顶部图片），改为按元素位置二分查找当前视口顶部的图片。
   useEffect(() => {
     if (mode !== 'scroll' || status !== 'ready') return;
     const root = stageRef.current;
-    if (!root || typeof IntersectionObserver === 'undefined') return;
-    const io = new IntersectionObserver(
-      (entries) => {
-        const visible = entries.filter((e) => e.isIntersecting);
-        if (visible.length === 0) return;
-        visible.sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
-        const first = visible[0];
-        if (!first) return;
-        const idx = Number((first.target as HTMLElement).dataset.index);
-        if (!Number.isNaN(idx)) setCurrentIndex(idx);
-      },
-      { root, rootMargin: '0px 0px -50% 0px', threshold: 0 },
-    );
-    root.querySelectorAll('.scroll__item').forEach((el) => io.observe(el));
-    return () => io.disconnect();
+    if (!root) return;
+    let raf = 0;
+
+    const compute = () => {
+      raf = 0;
+      const items = root.querySelectorAll<HTMLElement>('.scroll__item');
+      if (items.length === 0) return;
+      const rootTop = root.getBoundingClientRect().top + (parseFloat(getComputedStyle(root).paddingTop) || 0);
+      let lo = 0;
+      let hi = items.length - 1;
+      let best = 0;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        const item = items[mid];
+        if (!item) break;
+        const top = item.getBoundingClientRect().top;
+        if (top <= rootTop + 4) {
+          best = mid;
+          lo = mid + 1;
+        } else {
+          hi = mid - 1;
+        }
+      }
+      setCurrentIndex(best);
+    };
+
+    const schedule = () => {
+      if (!raf) raf = requestAnimationFrame(compute);
+    };
+
+    const inner = root.querySelector('.scroll');
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(schedule) : null;
+    if (inner) ro?.observe(inner);
+
+    root.addEventListener('scroll', schedule, { passive: true });
+    window.addEventListener('resize', schedule);
+    compute();
+
+    return () => {
+      root.removeEventListener('scroll', schedule);
+      window.removeEventListener('resize', schedule);
+      ro?.disconnect();
+      if (raf) cancelAnimationFrame(raf);
+    };
   }, [mode, status, images]);
 
   // 记忆阅读位置：同一文件夹下次打开恢复到上次所在图片
@@ -273,6 +351,11 @@ export default function App() {
     return () => el.removeEventListener('scroll', onScroll);
   }, [mode, status, images]);
 
+  // 目录栏：当前项保持在可视区域内
+  useEffect(() => {
+    activeItemRef.current?.scrollIntoView({ block: 'nearest' });
+  }, [currentIndex, dirQuery, dirVisible]);
+
   async function restoreLastDir() {
     const handle = await loadLastDir();
     if (!handle) return;
@@ -288,6 +371,8 @@ export default function App() {
   async function loadFromHandle(handle: FileSystemDirectoryHandle) {
     setStatus('loading');
     setError('');
+    setWarningDismissed(false);
+    setDirQuery('');
     try {
       const result = await scanTopLevelImages(handle);
       setImages(result.images);
@@ -302,9 +387,8 @@ export default function App() {
       setCurrentIndex(startIndex);
       setStatus('ready');
       if (startIndex > 0) {
-        window.setTimeout(() => {
-          document.getElementById(`img-${startIndex}`)?.scrollIntoView({ block: 'start' });
-        }, 120);
+        // 图片为懒加载，先滚动一次后等其高度确定再校正一次，避免落点偏移
+        window.setTimeout(() => scrollToImage(startIndex, 'auto'), 120);
       }
     } catch (e) {
       setStatus('error');
@@ -345,6 +429,21 @@ export default function App() {
     setView({ s: 1, x: 0, y: 0 });
   }
 
+  /** 以舞台中心为锚点缩放（状态栏按钮） */
+  function zoomBy(factor: number) {
+    if (mode === 'scroll') {
+      setView((v) => ({ ...v, s: clampZoom(v.s * factor) }));
+      return;
+    }
+    const el = stageRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    const mx = (r.width - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0)) / 2;
+    const my = (r.height - (parseFloat(cs.paddingTop) || 0) - (parseFloat(cs.paddingBottom) || 0)) / 2;
+    setView((v) => zoomAround(v, mx, my, factor));
+  }
+
   function toggleTheme() {
     const next: ReaderConfig['theme'] = config.theme === 'dark' ? 'light' : 'dark';
     const apply = () => {
@@ -362,7 +461,7 @@ export default function App() {
   }
 
   function onStageClick(e: React.MouseEvent) {
-    if (mode === 'scroll' || view.s !== 1) return;
+    if (mode === 'scroll' || view.s !== 1 || images.length === 0) return;
     const stage = stageRef.current;
     if (!stage) return;
     const rect = stage.getBoundingClientRect();
@@ -390,26 +489,48 @@ export default function App() {
     e.preventDefault();
   }
 
+  /** 滚动定位到指定图片：图片懒加载会改变高度，故分多次校正落点（用户滚动/按键会取消） */
+  function scrollToImage(index: number, behavior: ScrollBehavior = 'smooth') {
+    const seq = ++jumpSeqRef.current;
+    const scroll = () => {
+      if (jumpSeqRef.current !== seq) return;
+      document.getElementById(`img-${index}`)?.scrollIntoView({ behavior, block: 'start' });
+    };
+    [0, 350, 800, 1300].forEach((delay) => window.setTimeout(scroll, delay));
+  }
+
   function jumpTo(index: number) {
     setCurrentIndex(index);
     if (mode === 'scroll') {
-      document.getElementById(`img-${index}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      scrollToImage(index);
     }
   }
+
+  const filtered = useMemo(() => {
+    const q = dirQuery.trim().toLowerCase();
+    return images
+      .map((img, index) => ({ img, index }))
+      .filter(({ img }) => !q || img.name.toLowerCase().includes(q));
+  }, [images, dirQuery]);
 
   const currentNames = (() => {
     if (mode === 'single') return [images[currentIndex]?.name ?? ''];
     if (mode === 'double') {
       return doubleIndices(currentSpread, images.length).map((i) => images[i]?.name ?? '');
     }
-    return [];
+    return [images[currentIndex]?.name ?? ''];
   })();
 
   const pageInfo = (() => {
+    if (images.length === 0) return '0 / 0';
     if (mode === 'single') return `${currentIndex + 1} / ${images.length}`;
     if (mode === 'double') return `${currentSpread + 1} / ${spreadCount}`;
     return `${scrollProgress}%`;
   })();
+
+  const canPrev = mode === 'single' ? currentIndex > 0 : currentSpread > 0;
+  const canNext =
+    mode === 'single' ? currentIndex < images.length - 1 : currentSpread < spreadCount - 1;
 
   // 目录栏高亮索引集合：双页模式高亮整屏，其余模式高亮当前项
   const activeIndices = (() => {
@@ -417,80 +538,154 @@ export default function App() {
     return new Set([currentIndex]);
   })();
 
+  const activeModeIndex = Math.max(
+    MODES.findIndex((m) => m.key === mode),
+    0,
+  );
+
   return (
     <div className="reader">
       {barsVisible && (
         <header className="toolbar">
-          <button className="toolbar__import" onClick={importFolder}>
-            {t(lang, 'importFolder')}
-          </button>
-          <button
-            className="toolbar__dir"
-            title={t(lang, 'dirHint')}
-            onClick={() => setDirVisible((v) => !v)}
-          >
-            {t(lang, dirVisible ? 'hideDir' : 'showDir')}
-          </button>
-          {reauthNeeded && (
-            <button className="toolbar__reauth" onClick={() => void reauthorize()}>
-              {t(lang, 'reauth')}
-            </button>
-          )}
-          {dirName && <span className="toolbar__dirname">{dirName}</span>}
+          <div className="toolbar__group toolbar__group--left">
+            <span className="brand">
+              <Logo size={24} />
+              <span className="brand__name">{t(lang, 'name')}</span>
+            </span>
 
-          <div className="toolbar__modes" role="group" aria-label="reading mode">
-            {MODES.map((m) => (
-              <button
-                key={m.key}
-                className={`mode-btn${mode === m.key ? ' mode-btn--active' : ''}`}
-                onClick={() => selectMode(m.key)}
-              >
-                {t(lang, m.labelKey)}
+            <button className="btn btn--primary" onClick={importFolder}>
+              <Icon name="folderPlus" size={15} />
+              {t(lang, 'importFolder')}
+            </button>
+
+            {dirName && (
+              <span className="chip" title={dirName}>
+                <Icon name="folder" size={13} />
+                <span className="chip__text">{dirName}</span>
+              </span>
+            )}
+
+            {reauthNeeded && (
+              <button className="btn btn--warn" onClick={() => void reauthorize()}>
+                <Icon name="alert" size={14} />
+                {t(lang, 'reauth')}
               </button>
-            ))}
+            )}
           </div>
 
-          <button className="toolbar__restore" onClick={resetZoom}>
-            {t(lang, 'restore')}
-          </button>
+          <div className="toolbar__group toolbar__group--center">
+            <div className="segmented" role="group" aria-label="reading mode">
+              <span
+                className="segmented__thumb"
+                style={{ transform: `translateX(${activeModeIndex * 100}%)` }}
+              />
+              {MODES.map((m) => (
+                <button
+                  key={m.key}
+                  className={`segmented__btn${mode === m.key ? ' segmented__btn--active' : ''}`}
+                  onClick={() => selectMode(m.key)}
+                  aria-pressed={mode === m.key}
+                >
+                  <Icon name={m.icon} size={14} />
+                  <span className="segmented__label">{t(lang, m.labelKey)}</span>
+                </button>
+              ))}
+            </div>
+          </div>
 
-          <button
-            className="toolbar__theme"
-            title={t(lang, 'themeToggle')}
-            onClick={toggleTheme}
-          >
-            {config.theme === 'dark' ? '☀' : '☾'}
-          </button>
-
-          <button
-            className="toolbar__hide"
-            title={t(lang, 'hide')}
-            onClick={() => {
-              setBarsVisible(false);
-              setDirVisible(false);
-            }}
-          >
-            {t(lang, 'hide')}
-          </button>
+          <div className="toolbar__group toolbar__group--right">
+            <button
+              className={`icon-btn${dirVisible ? ' icon-btn--active' : ''}`}
+              title={t(lang, 'dirHint')}
+              aria-label={t(lang, dirVisible ? 'hideDir' : 'showDir')}
+              onClick={() => setDirVisible((v) => !v)}
+            >
+              <Icon name="sidebar" size={17} />
+            </button>
+            <button
+              className="icon-btn"
+              title={`${t(lang, 'themeToggle')} · ${t(lang, config.theme === 'dark' ? 'themeLight' : 'themeDark')}`}
+              aria-label={t(lang, 'themeToggle')}
+              onClick={toggleTheme}
+            >
+              <Icon name={config.theme === 'dark' ? 'sun' : 'moon'} size={17} />
+            </button>
+            <button
+              className="icon-btn"
+              title={`${t(lang, 'shortcuts')} (?)`}
+              aria-label={t(lang, 'shortcuts')}
+              onClick={() => setHintsOpen(true)}
+            >
+              <Icon name="help" size={17} />
+            </button>
+            <button
+              className="icon-btn"
+              title={`${t(lang, 'hide')} (${hideKey})`}
+              aria-label={t(lang, 'hide')}
+              onClick={() => {
+                setBarsVisible(false);
+                setDirVisible(false);
+              }}
+            >
+              <Icon name="eyeOff" size={17} />
+            </button>
+          </div>
         </header>
       )}
 
       <div className="reader__body">
         <aside className={`dirlist${dirVisible ? '' : ' dirlist--hidden'}`}>
+          <div className="dirlist__head">
+            <span className="dirlist__title">{t(lang, 'fileList')}</span>
+            <span className="dirlist__count">{t(lang, 'imageCount', { n: images.length })}</span>
+          </div>
+
+          <div className="dirlist__search">
+            <Icon name="search" size={14} />
+            <input
+              className="dirlist__input"
+              value={dirQuery}
+              onChange={(e) => setDirQuery(e.target.value)}
+              placeholder={t(lang, 'searchPlaceholder')}
+              aria-label={t(lang, 'searchPlaceholder')}
+              spellCheck={false}
+            />
+            {dirQuery && (
+              <button
+                className="dirlist__clear"
+                onClick={() => setDirQuery('')}
+                aria-label={t(lang, 'close')}
+                title={t(lang, 'close')}
+              >
+                <Icon name="close" size={12} />
+              </button>
+            )}
+          </div>
+
           {status === 'loading' && <p className="hint">{t(lang, 'loading')}</p>}
           {status === 'idle' && <p className="hint">{t(lang, 'importPrompt')}</p>}
           {status === 'ready' && images.length === 0 && <p className="hint">{t(lang, 'noImages')}</p>}
+          {status === 'ready' && images.length > 0 && filtered.length === 0 && (
+            <p className="hint">{t(lang, 'searchEmpty')}</p>
+          )}
+
           <ul className="dirlist__items">
-            {images.map((img, index) => (
-              <li
-                key={img.name}
-                className={`dirlist__item${activeIndices.has(index) ? ' dirlist__item--active' : ''}`}
-                title={img.name}
-                onClick={() => jumpTo(index)}
-              >
-                {img.name}
-              </li>
-            ))}
+            {filtered.map(({ img, index }) => {
+              const active = activeIndices.has(index);
+              return (
+                <li key={img.name}>
+                  <button
+                    ref={active ? activeItemRef : undefined}
+                    className={`dirlist__item${active ? ' dirlist__item--active' : ''}`}
+                    title={img.name}
+                    onClick={() => jumpTo(index)}
+                  >
+                    <span className="dirlist__no">{String(index + 1).padStart(2, '0')}</span>
+                    <span className="dirlist__name">{img.name}</span>
+                  </button>
+                </li>
+              );
+            })}
           </ul>
         </aside>
 
@@ -500,9 +695,80 @@ export default function App() {
           onClick={onStageClick}
           onDoubleClick={onStageDoubleClick}
         >
-          {status === 'idle' && <p className="stage__empty">{t(lang, 'emptyHint')}</p>}
-          {hasSubfolders && <p className="warning">{t(lang, 'subfolderWarning')}</p>}
-          {error && <p className="error">{error}</p>}
+          {status === 'idle' && (
+            <div className="empty">
+              <svg className="empty__art" viewBox="0 0 160 120" aria-hidden="true">
+                <rect x="18" y="26" width="94" height="70" rx="10" fill="currentColor" opacity=".07" />
+                <rect x="30" y="16" width="94" height="70" rx="10" fill="currentColor" opacity=".1" />
+                <rect x="44" y="8" width="94" height="70" rx="10" fill="currentColor" opacity=".14" />
+                <path
+                  d="M70 40c4.2 5.6 9.3 8.4 15.2 8.4 5.1 0 9.2-3.7 9.2-8.4s-4.1-8.4-9.2-8.4c-5.9 0-11 2.8-15.2 8.4z"
+                  fill="var(--accent)"
+                  opacity=".55"
+                />
+                <path d="M70.6 40 64 34v12z" fill="var(--accent)" opacity=".55" />
+                <circle cx="89" cy="38" r="1.6" fill="var(--panel)" />
+                <path d="M56 62h50M56 70h34" stroke="currentColor" strokeWidth="3" strokeLinecap="round" opacity=".16" />
+              </svg>
+              <h2 className="empty__title">{t(lang, 'emptyTitle')}</h2>
+              <p className="empty__desc">{t(lang, 'emptyDesc')}</p>
+              <div className="empty__actions">
+                <button className="btn btn--primary btn--lg" onClick={importFolder}>
+                  <Icon name="folderPlus" size={16} />
+                  {t(lang, 'importFolder')}
+                </button>
+              </div>
+              <p className="empty__hint">{t(lang, 'emptySupport')}</p>
+            </div>
+          )}
+
+          {status === 'loading' && (
+            <div className="empty">
+              <span className="spinner" aria-hidden="true" />
+              <p className="empty__desc">{t(lang, 'loading')}</p>
+            </div>
+          )}
+
+          {status === 'ready' && images.length === 0 && (
+            <div className="empty">
+              <span className="empty__badge">
+                <Icon name="image" size={24} />
+              </span>
+              <h2 className="empty__title">{t(lang, 'noImages')}</h2>
+              <p className="empty__desc">{t(lang, 'emptyDesc')}</p>
+              <div className="empty__actions">
+                <button className="btn btn--primary btn--lg" onClick={importFolder}>
+                  <Icon name="folderPlus" size={16} />
+                  {t(lang, 'importFolder')}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {barsVisible && hasSubfolders && !warningDismissed && (
+            <div className="banner banner--warn" role="status">
+              <Icon name="alert" size={15} />
+              <span className="banner__text">{t(lang, 'subfolderWarning')}</span>
+              <button
+                className="banner__close"
+                title={t(lang, 'dismiss')}
+                aria-label={t(lang, 'dismiss')}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setWarningDismissed(true);
+                }}
+              >
+                <Icon name="close" size={13} />
+              </button>
+            </div>
+          )}
+
+          {barsVisible && error && (
+            <div className="banner banner--error" role="alert">
+              <Icon name="alert" size={15} />
+              <span className="banner__text">{error}</span>
+            </div>
+          )}
 
           {status === 'ready' && mode === 'scroll' && (
             <div ref={scrollRef} className="scroll">
@@ -552,26 +818,187 @@ export default function App() {
               ))}
             </div>
           )}
+
+          {status === 'ready' && images.length > 0 && mode !== 'scroll' && view.s === 1 && (
+            <>
+              <button
+                className="pager pager--prev"
+                disabled={!canPrev}
+                title={t(lang, 'prevPage')}
+                aria-label={t(lang, 'prevPage')}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  goPrev();
+                }}
+                onDoubleClick={(e) => e.stopPropagation()}
+              >
+                <Icon name="chevronLeft" size={20} />
+              </button>
+              <button
+                className="pager pager--next"
+                disabled={!canNext}
+                title={t(lang, 'nextPage')}
+                aria-label={t(lang, 'nextPage')}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  goNext();
+                }}
+                onDoubleClick={(e) => e.stopPropagation()}
+              >
+                <Icon name="chevronRight" size={20} />
+              </button>
+            </>
+          )}
         </main>
       </div>
 
       {barsVisible && (
         <footer className="statusbar">
-          <span className="statusbar__page">{pageInfo}</span>
-          <span className="statusbar__name">{currentNames.filter(Boolean).join(' ｜ ')}</span>
-          <span className="statusbar__zoom">{Math.round(view.s * 100)}%</span>
+          <div className="statusbar__left">
+            {mode === 'scroll' && images.length > 0 && (
+              <span className="progress" aria-hidden="true">
+                <span className="progress__fill" style={{ width: `${scrollProgress}%` }} />
+              </span>
+            )}
+            {images.length > 0 && (
+              <span className="statusbar__page" title={mode === 'scroll' ? t(lang, 'progress') : undefined}>
+                {pageInfo}
+              </span>
+            )}
+          </div>
+
+          <div className="statusbar__center">
+            <span className="statusbar__name">{currentNames.filter(Boolean).join(' ｜ ')}</span>
+          </div>
+
+          <div className="statusbar__right">
+            <button
+              className="zoom-btn"
+              title={t(lang, 'zoomOut')}
+              aria-label={t(lang, 'zoomOut')}
+              onClick={() => zoomBy(1 / 1.1)}
+            >
+              <Icon name="minus" size={14} />
+            </button>
+            <button
+              className="zoom-value"
+              title={t(lang, 'resetZoom')}
+              onClick={resetZoom}
+            >
+              {Math.round(view.s * 100)}%
+            </button>
+            <button
+              className="zoom-btn"
+              title={t(lang, 'zoomIn')}
+              aria-label={t(lang, 'zoomIn')}
+              onClick={() => zoomBy(1.1)}
+            >
+              <Icon name="plus" size={14} />
+            </button>
+          </div>
         </footer>
       )}
 
       {!barsVisible && (
         <>
-          <div className="reveal reveal--top" onClick={() => setBarsVisible(true)}>
-            <span className="reveal__handle">{t(lang, 'showBarsTop')}</span>
-          </div>
-          <div className="reveal reveal--bottom" onClick={() => setBarsVisible(true)}>
-            <span className="reveal__handle">{t(lang, 'showBarsBottom')}</span>
-          </div>
+          <button
+            className="reveal reveal--top"
+            onClick={() => {
+              setBarsVisible(true);
+              setDirVisible(true);
+            }}
+          >
+            <Icon name="chevronDown" size={12} />
+            <span>{t(lang, 'showBarsTop')}</span>
+          </button>
+          <button
+            className="reveal reveal--bottom"
+            onClick={() => {
+              setBarsVisible(true);
+              setDirVisible(true);
+            }}
+          >
+            <span>{t(lang, 'showBarsBottom')}</span>
+            <Icon name="chevronDown" size={12} style={{ transform: 'rotate(180deg)' }} />
+          </button>
         </>
+      )}
+
+      {hintsOpen && (
+        <div className="sheet-scrim" onClick={() => setHintsOpen(false)}>
+          <div
+            className="sheet"
+            role="dialog"
+            aria-modal="true"
+            aria-label={t(lang, 'shortcutsTitle')}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="sheet__head">
+              <h3 className="sheet__title">{t(lang, 'shortcutsTitle')}</h3>
+              <button
+                className="icon-btn"
+                onClick={() => setHintsOpen(false)}
+                aria-label={t(lang, 'close')}
+                title={t(lang, 'close')}
+              >
+                <Icon name="close" size={16} />
+              </button>
+            </div>
+            <ul className="sheet__rows">
+              <li className="sheet__row">
+                <span>{t(lang, 'scTurn')}</span>
+                <span className="sheet__keys">
+                  <kbd>←</kbd>
+                  <kbd>→</kbd>
+                  <kbd>↑</kbd>
+                  <kbd>↓</kbd>
+                  <kbd>PageUp</kbd>
+                  <kbd>PageDown</kbd>
+                  <span className="sheet__sep">/</span>
+                  <span className="sheet__text">{t(lang, 'scWheel')}</span>
+                </span>
+              </li>
+              <li className="sheet__row">
+                <span>{t(lang, 'scZoom')}</span>
+                <span className="sheet__keys">
+                  <kbd>Ctrl</kbd>
+                  <span className="sheet__sep">+</span>
+                  <span className="sheet__text">{t(lang, 'scWheel')}</span>
+                </span>
+              </li>
+              <li className="sheet__row">
+                <span>{t(lang, 'scReset')}</span>
+                <span className="sheet__keys">
+                  <span className="sheet__text">{t(lang, 'scResetKeys')}</span>
+                </span>
+              </li>
+              <li className="sheet__row">
+                <span>{t(lang, 'scDir')}</span>
+                <span className="sheet__keys">
+                  <kbd>D</kbd>
+                </span>
+              </li>
+              <li className="sheet__row">
+                <span>{t(lang, 'scImmersive')}</span>
+                <span className="sheet__keys">
+                  <kbd>{hideKey}</kbd>
+                </span>
+              </li>
+              <li className="sheet__row">
+                <span>{t(lang, 'scHelp')}</span>
+                <span className="sheet__keys">
+                  <kbd>?</kbd>
+                </span>
+              </li>
+              <li className="sheet__row">
+                <span>{t(lang, 'scCloseSheet')}</span>
+                <span className="sheet__keys">
+                  <kbd>Esc</kbd>
+                </span>
+              </li>
+            </ul>
+          </div>
+        </div>
       )}
     </div>
   );
