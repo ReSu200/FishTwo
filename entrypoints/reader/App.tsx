@@ -106,6 +106,14 @@ export default function App() {
 
   // 配置实时同步（主题/语言/快捷键等）
   useEffect(() => {
+    const onChanged = (() => {
+      try {
+        return typeof chrome !== 'undefined' && chrome?.storage?.onChanged ? chrome.storage.onChanged : null;
+      } catch {
+        return null;
+      }
+    })();
+    if (!onChanged) return;
     function listener(changes: Record<string, unknown>) {
       const change = changes['config'] as { newValue?: ReaderConfig } | undefined;
       const next = change?.newValue;
@@ -114,8 +122,8 @@ export default function App() {
       setConfig(next);
       setLang(resolveLang(next.lang));
     }
-    browser.storage.onChanged.addListener(listener);
-    return () => browser.storage.onChanged.removeListener(listener);
+    onChanged.addListener(listener);
+    return () => onChanged.removeListener(listener);
   }, []);
 
   // 键盘：翻页 + 隐藏/唤回状态栏

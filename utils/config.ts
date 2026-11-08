@@ -25,22 +25,63 @@ export const DEFAULT_CONFIG: ReaderConfig = {
 const CONFIG_KEY = 'config';
 const LAST_ZOOM_KEY = 'lastZoom';
 
+/**
+ * 安全获取 storage 区域。
+ * 说明：WebExtension 的 storage 在极少数上下文（如非扩展页面、受限环境）可能不可用，
+ * 直接访问 `chrome.storage.xxx` 会抛错并导致阅读器整页白屏，故此处做边界防御，
+ * 不可用时返回 null，由调用方降级为默认值。
+ */
+function getStorageArea(kind: 'sync' | 'local') {
+  try {
+    if (typeof chrome !== 'undefined' && chrome?.storage?.[kind]) {
+      return chrome.storage[kind];
+    }
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
 export async function loadConfig(): Promise<ReaderConfig> {
-  const stored = await browser.storage.sync.get(CONFIG_KEY);
-  const raw = (stored?.[CONFIG_KEY] ?? {}) as Partial<ReaderConfig>;
-  return { ...DEFAULT_CONFIG, ...raw };
+  const area = getStorageArea('sync');
+  if (!area) return { ...DEFAULT_CONFIG };
+  try {
+    const stored = await area.get(CONFIG_KEY);
+    const raw = (stored?.[CONFIG_KEY] ?? {}) as Partial<ReaderConfig>;
+    return { ...DEFAULT_CONFIG, ...raw };
+  } catch {
+    return { ...DEFAULT_CONFIG };
+  }
 }
 
 export async function saveConfig(config: ReaderConfig): Promise<void> {
-  await browser.storage.sync.set({ [CONFIG_KEY]: config });
+  const area = getStorageArea('sync');
+  if (!area) return;
+  try {
+    await area.set({ [CONFIG_KEY]: config });
+  } catch {
+    /* ignore */
+  }
 }
 
 export async function loadLastZoom(): Promise<number | undefined> {
-  const stored = await browser.storage.local.get(LAST_ZOOM_KEY);
-  const v = stored?.[LAST_ZOOM_KEY];
-  return typeof v === 'number' ? v : undefined;
+  const area = getStorageArea('local');
+  if (!area) return undefined;
+  try {
+    const stored = await area.get(LAST_ZOOM_KEY);
+    const v = stored?.[LAST_ZOOM_KEY];
+    return typeof v === 'number' ? v : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export async function saveLastZoom(zoom: number): Promise<void> {
-  await browser.storage.local.set({ [LAST_ZOOM_KEY]: zoom });
+  const area = getStorageArea('local');
+  if (!area) return;
+  try {
+    await area.set({ [LAST_ZOOM_KEY]: zoom });
+  } catch {
+    /* ignore */
+  }
 }

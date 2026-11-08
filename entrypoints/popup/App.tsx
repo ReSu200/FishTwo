@@ -51,7 +51,11 @@ export default function App() {
   }
 
   function openReader() {
-    browser.tabs.create({ url: browser.runtime.getURL('/reader.html') });
+    try {
+      chrome.tabs.create({ url: chrome.runtime.getURL('/reader.html') });
+    } catch (e) {
+      console.error('Failed to open reader', e);
+    }
   }
 
   return (

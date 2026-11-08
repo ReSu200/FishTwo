@@ -19,3 +19,6 @@ interface Window {
       | FileSystemHandle;
   }): Promise<FileSystemDirectoryHandle>;
 }
+
+// Chromium 扩展页面使用完整的 chrome 命名空间（Edge 的 browser 别名可能不完整，缺 storage）
+declare const chrome: typeof browser;

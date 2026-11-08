@@ -7,7 +7,7 @@ export default defineConfig({
     name: '__MSG_extName__',
     description: '__MSG_extDescription__',
     default_locale: 'zh_CN',
-    version: '0.0.2',
+    version: '0.0.3',
     action: {
       default_icon: {
         16: '/icons/16.png',
