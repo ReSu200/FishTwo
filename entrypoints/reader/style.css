@@ -1,0 +1,359 @@
+:root {
+  --bg: #f5f7f6;
+  --panel: #ffffff;
+  --text: #1f2937;
+  --text-dim: #6b7280;
+  --accent: #2bb39a;
+  --border: #e5e7eb;
+  --hover: #eef2f1;
+  --active-bg: #dbf1ec;
+  --active-text: #117a63;
+  --warning-bg: #fef3c7;
+  --warning-text: #b45309;
+  --error-bg: #fee2e2;
+  --error-text: #b91c1c;
+}
+
+:root[data-theme='dark'] {
+  --bg: #1e2124;
+  --panel: #26292c;
+  --text: #e5e7eb;
+  --text-dim: #9aa1a9;
+  --accent: #35c4a8;
+  --border: #3a3f45;
+  --hover: #33383e;
+  --active-bg: #1f3a34;
+  --active-text: #3dd2b4;
+  --warning-bg: #3a3217;
+  --warning-text: #f0c674;
+  --error-bg: #3a2323;
+  --error-text: #f8a5a5;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+}
+
+.reader {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  color: var(--text);
+  background: var(--bg);
+  overflow: hidden;
+}
+
+/* 顶部工具栏 */
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+
+.toolbar__import,
+.toolbar__hide {
+  padding: 7px 14px;
+  border: none;
+  border-radius: 6px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.toolbar__import:hover,
+.toolbar__hide:hover {
+  filter: brightness(0.95);
+}
+
+.toolbar__hide {
+  background: transparent;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  margin-left: auto;
+}
+
+.toolbar__reauth,
+.toolbar__restore {
+  padding: 7px 14px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.toolbar__reauth:hover,
+.toolbar__restore:hover {
+  background: var(--hover);
+}
+
+.toolbar__dirname {
+  font-size: 13px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 220px;
+}
+
+.toolbar__modes {
+  display: flex;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  margin-left: auto;
+}
+
+.mode-btn {
+  padding: 7px 12px;
+  border: none;
+  background: var(--panel);
+  color: var(--text-dim);
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.mode-btn + .mode-btn {
+  border-left: 1px solid var(--border);
+}
+
+.mode-btn--active {
+  background: var(--accent);
+  color: #fff;
+}
+
+/* 主体 */
+.reader__body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+/* 左侧目录 */
+.dirlist {
+  width: 220px;
+  flex-shrink: 0;
+  overflow-y: auto;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+}
+
+.dirlist__items {
+  margin: 0;
+  padding: 8px 0;
+  list-style: none;
+}
+
+.dirlist__item {
+  padding: 6px 16px;
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.dirlist__item:hover {
+  background: var(--hover);
+}
+
+.dirlist__item--active {
+  background: var(--active-bg);
+  color: var(--active-text);
+}
+
+.hint {
+  margin: 16px;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+/* 阅读舞台 */
+.stage {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  gap: 12px;
+}
+
+.stage--scroll {
+  display: block;
+  overflow-y: auto;
+  padding: 0;
+}
+
+.stage--single,
+.stage--double {
+  cursor: pointer;
+}
+
+.stage__empty {
+  color: var(--text-dim);
+  font-size: 14px;
+}
+
+.warning {
+  font-size: 13px;
+  color: var(--warning-text);
+  background: var(--warning-bg);
+  padding: 8px 12px;
+  border-radius: 6px;
+}
+
+.error {
+  font-size: 13px;
+  color: var(--error-text);
+  background: var(--error-bg);
+  padding: 8px 12px;
+  border-radius: 6px;
+}
+
+/* 图片基础 */
+.image-item {
+  max-width: 100%;
+  max-height: 100%;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  user-select: none;
+}
+
+.image-item--loading {
+  min-width: 160px;
+  min-height: 200px;
+  background: var(--hover);
+  border-radius: 4px;
+}
+
+/* 下拉滚动模式 */
+.scroll {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  padding: 16px;
+}
+
+.scroll__item {
+  max-width: 100%;
+}
+
+.scroll__item .image-item {
+  display: block;
+}
+
+/* 单页模式 */
+.single {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* 双页模式 */
+.double {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+}
+
+.double__page {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.double__page .image-item {
+  max-width: 100%;
+  max-height: 100%;
+}
+
+/* 底部信息栏 */
+.statusbar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 16px;
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.statusbar__page {
+  flex-shrink: 0;
+}
+
+.statusbar__name {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: center;
+}
+
+.statusbar__zoom {
+  flex-shrink: 0;
+}
+
+/* 隐藏后的悬浮唤回条 */
+.reveal {
+  position: fixed;
+  left: 0;
+  right: 0;
+  height: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+  cursor: pointer;
+  opacity: 0.35;
+  transition: opacity 0.15s;
+}
+
+.reveal:hover {
+  opacity: 1;
+}
+
+.reveal--top {
+  top: 0;
+}
+
+.reveal--bottom {
+  bottom: 0;
+}
+
+.reveal__handle {
+  font-size: 11px;
+  color: #fff;
+  background: var(--accent);
+  padding: 2px 10px;
+  border-radius: 0 0 6px 6px;
+}
+
+.reveal--bottom .reveal__handle {
+  border-radius: 6px 6px 0 0;
+}
