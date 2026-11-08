@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { scanTopLevelImages, type ImageEntry } from '@/utils/files';
 import { saveLastDir, loadLastDir } from '@/utils/db';
 import { doubleSpreadCount, spreadOfIndex, doubleIndices } from '@/utils/paging';
@@ -39,17 +39,45 @@ export default function App() {
   const [barsVisible, setBarsVisible] = useState(true);
   const [zoom, setZoom] = useState(1);
   const [origin, setOrigin] = useState('50% 50%');
+  const [offset, setOffset] = useState({ x: 0, y: 0 });
 
   // 已存句柄但权限待确认时，展示「重新授权」
   const [storedHandle, setStoredHandle] = useState<FileSystemDirectoryHandle | null>(null);
   const [reauthNeeded, setReauthNeeded] = useState(false);
 
   const stageRef = useRef<HTMLElement | null>(null);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
   const lastFlipRef = useRef(0);
   const clickTimerRef = useRef<number | undefined>(undefined);
+  const dragRef = useRef<{ startX: number; startY: number; originX: number; originY: number } | null>(null);
 
   const spreadCount = doubleSpreadCount(images.length);
   const currentSpread = spreadOfIndex(currentIndex);
+
+  // 翻页逻辑（键盘/滚轮/点击共享；useCallback 稳定引用以配合 effect 依赖）
+  const goPrev = useCallback(() => {
+    if (mode === 'single') {
+      setCurrentIndex((i) => Math.max(i - 1, 0));
+    } else if (mode === 'double') {
+      setCurrentIndex((i) => {
+        const prevSpread = Math.max(spreadOfIndex(i) - 1, 0);
+        return doubleIndices(prevSpread, images.length)[0] ?? 0;
+      });
+    }
+    setOffset({ x: 0, y: 0 });
+  }, [mode, images.length]);
+
+  const goNext = useCallback(() => {
+    if (mode === 'single') {
+      setCurrentIndex((i) => Math.min(i + 1, images.length - 1));
+    } else if (mode === 'double') {
+      setCurrentIndex((i) => {
+        const nextSpread = Math.min(spreadOfIndex(i) + 1, doubleSpreadCount(images.length) - 1);
+        return doubleIndices(nextSpread, images.length)[0] ?? i;
+      });
+    }
+    setOffset({ x: 0, y: 0 });
+  }, [mode, images.length]);
 
   // 初始化配置 + 自动恢复最近文件夹
   useEffect(() => {
@@ -79,7 +107,8 @@ export default function App() {
   // 配置实时同步（主题/语言/快捷键等）
   useEffect(() => {
     function listener(changes: Record<string, unknown>) {
-      const next = changes['config'] as ReaderConfig | undefined;
+      const change = changes['config'] as { newValue?: ReaderConfig } | undefined;
+      const next = change?.newValue;
       if (!next) return;
       document.documentElement.dataset.theme = next.theme;
       setConfig(next);
@@ -108,7 +137,7 @@ export default function App() {
     }
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  });
+  }, [config.hideKey, mode, goPrev, goNext]);
 
   // 滚轮：Ctrl+滚轮缩放（以鼠标为中心），普通滚轮翻页；原生监听支持 preventDefault
   useEffect(() => {
@@ -138,7 +167,49 @@ export default function App() {
     }
     el.addEventListener('wheel', onWheelNative, { passive: false });
     return () => el.removeEventListener('wheel', onWheelNative);
-  });
+  }, [mode, goPrev, goNext]);
+
+  // 单/双页缩放后拖拽平移（仅 zoom>1 时生效）
+  useEffect(() => {
+    function onMove(e: MouseEvent) {
+      const drag = dragRef.current;
+      if (!drag) return;
+      setOffset({
+        x: drag.originX + (e.clientX - drag.startX),
+        y: drag.originY + (e.clientY - drag.startY),
+      });
+    }
+    function onUp() {
+      dragRef.current = null;
+    }
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+  }, []);
+
+  // 下拉滚动模式：随滚动更新当前图片索引，实现目录高亮与阅读进度双向同步
+  useEffect(() => {
+    if (mode !== 'scroll' || status !== 'ready') return;
+    const root = stageRef.current;
+    if (!root || typeof IntersectionObserver === 'undefined') return;
+    const io = new IntersectionObserver(
+      (entries) => {
+        const visible = entries.filter((e) => e.isIntersecting);
+        if (visible.length === 0) return;
+        visible.sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+        const first = visible[0];
+        if (!first) return;
+        const idx = Number((first.target as HTMLElement).dataset.index);
+        if (!Number.isNaN(idx)) setCurrentIndex(idx);
+      },
+      { root, rootMargin: '0px 0px -50% 0px', threshold: 0 },
+    );
+    root.querySelectorAll('.scroll__item').forEach((el) => io.observe(el));
+    return () => io.disconnect();
+  }, [mode, status, images]);
 
   async function restoreLastDir() {
     const handle = await loadLastDir();
@@ -194,38 +265,21 @@ export default function App() {
   function selectMode(next: ReaderMode) {
     setMode(next);
     setCurrentIndex((i) => Math.min(i, Math.max(images.length - 1, 0)));
-  }
-
-  function goPrev() {
-    if (mode === 'single') {
-      setCurrentIndex((i) => Math.max(i - 1, 0));
-    } else if (mode === 'double') {
-      setCurrentIndex((i) => {
-        const prevSpread = Math.max(spreadOfIndex(i) - 1, 0);
-        return doubleIndices(prevSpread, images.length)[0] ?? 0;
-      });
-    }
-  }
-
-  function goNext() {
-    if (mode === 'single') {
-      setCurrentIndex((i) => Math.min(i + 1, images.length - 1));
-    } else if (mode === 'double') {
-      setCurrentIndex((i) => {
-        const nextSpread = Math.min(spreadOfIndex(i) + 1, doubleSpreadCount(images.length) - 1);
-        return doubleIndices(nextSpread, images.length)[0] ?? i;
-      });
-    }
+    setOffset({ x: 0, y: 0 });
   }
 
   function resetZoom() {
     setZoom(1);
     setOrigin('50% 50%');
+    setOffset({ x: 0, y: 0 });
   }
 
   function onStageClick(e: React.MouseEvent) {
     if (mode === 'scroll' || zoom !== 1) return;
-    const dir = e.clientX < window.innerWidth / 2 ? 'prev' : 'next';
+    const stage = stageRef.current;
+    if (!stage) return;
+    const rect = stage.getBoundingClientRect();
+    const dir = e.clientX < rect.left + rect.width / 2 ? 'prev' : 'next';
     window.clearTimeout(clickTimerRef.current);
     clickTimerRef.current = window.setTimeout(() => {
       if (dir === 'prev') goPrev();
@@ -236,6 +290,17 @@ export default function App() {
   function onStageDoubleClick() {
     window.clearTimeout(clickTimerRef.current);
     resetZoom();
+  }
+
+  function onZoomableMouseDown(e: React.MouseEvent) {
+    if (mode === 'scroll' || zoom <= 1) return;
+    dragRef.current = {
+      startX: e.clientX,
+      startY: e.clientY,
+      originX: offset.x,
+      originY: offset.y,
+    };
+    e.preventDefault();
   }
 
   function jumpTo(index: number) {
@@ -257,6 +322,12 @@ export default function App() {
     if (mode === 'single') return `${currentIndex + 1} / ${images.length}`;
     if (mode === 'double') return `${currentSpread + 1} / ${spreadCount}`;
     return t(lang, 'imageCount', { n: images.length });
+  })();
+
+  // 目录栏高亮索引集合：双页模式高亮整屏，其余模式高亮当前项
+  const activeIndices = (() => {
+    if (mode === 'double') return new Set(doubleIndices(currentSpread, images.length));
+    return new Set([currentIndex]);
   })();
 
   return (
@@ -308,9 +379,7 @@ export default function App() {
             {images.map((img, index) => (
               <li
                 key={img.name}
-                className={`dirlist__item${
-                  mode !== 'scroll' && index === currentIndex ? ' dirlist__item--active' : ''
-                }`}
+                className={`dirlist__item${activeIndices.has(index) ? ' dirlist__item--active' : ''}`}
                 title={img.name}
                 onClick={() => jumpTo(index)}
               >
@@ -331,9 +400,9 @@ export default function App() {
           {error && <p className="error">{error}</p>}
 
           {status === 'ready' && mode === 'scroll' && (
-            <div className="scroll">
+            <div ref={scrollRef} className="scroll">
               {images.map((img, index) => (
-                <div key={img.name} id={`img-${index}`} className="scroll__item" style={{ zoom }}>
+                <div key={img.name} id={`img-${index}`} data-index={index} className="scroll__item" style={{ zoom }}>
                   <ImageItem fileHandle={img.fileHandle} alt={img.name} lazy />
                 </div>
               ))}
@@ -343,7 +412,12 @@ export default function App() {
           {status === 'ready' && mode === 'single' && (
             <div
               className="single zoomable"
-              style={{ transform: `scale(${zoom})`, transformOrigin: origin }}
+              style={{
+                transform: `translate(${offset.x}px, ${offset.y}px) scale(${zoom})`,
+                transformOrigin: origin,
+                cursor: zoom > 1 ? 'grab' : undefined,
+              }}
+              onMouseDown={onZoomableMouseDown}
             >
               {images[currentIndex] && (
                 <ImageItem
@@ -357,7 +431,12 @@ export default function App() {
           {status === 'ready' && mode === 'double' && (
             <div
               className="double zoomable"
-              style={{ transform: `scale(${zoom})`, transformOrigin: origin }}
+              style={{
+                transform: `translate(${offset.x}px, ${offset.y}px) scale(${zoom})`,
+                transformOrigin: origin,
+                cursor: zoom > 1 ? 'grab' : undefined,
+              }}
+              onMouseDown={onZoomableMouseDown}
             >
               {doubleIndices(currentSpread, images.length).map((i) => (
                 <div key={images[i]?.name} className="double__page">
