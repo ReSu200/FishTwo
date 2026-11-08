@@ -148,6 +148,12 @@ body {
   user-select: none;
 }
 
+.logo {
+  display: block;
+  flex-shrink: 0;
+  object-fit: contain;
+}
+
 .brand__name {
   font-size: 13px;
   font-weight: 650;

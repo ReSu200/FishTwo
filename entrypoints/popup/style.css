@@ -75,6 +75,12 @@ body {
   padding: 2px 2px 14px;
 }
 
+.logo {
+  display: block;
+  flex-shrink: 0;
+  object-fit: contain;
+}
+
 .popup__brand {
   display: flex;
   flex-direction: column;
