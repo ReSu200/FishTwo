@@ -6,7 +6,10 @@ import ImageItem from '@/components/ImageItem';
 import {
   DEFAULT_CONFIG,
   loadConfig,
+  loadLastPosition,
   loadLastZoom,
+  saveConfig,
+  saveLastPosition,
   saveLastZoom,
   type ReaderConfig,
   type ReaderMode,
@@ -25,6 +28,16 @@ const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 5;
 const clampZoom = (v: number) => Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, v));
 
+/** 计算缩放为 s 时使内容居中所需的平移量（相对 stage 内容区，原点在左上角） */
+function centeredOffset(stage: HTMLElement | null, s: number) {
+  if (!stage || s === 1) return { x: 0, y: 0 };
+  const r = stage.getBoundingClientRect();
+  const cs = getComputedStyle(stage);
+  const w = r.width - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0);
+  const h = r.height - (parseFloat(cs.paddingTop) || 0) - (parseFloat(cs.paddingBottom) || 0);
+  return { x: (w / 2) * (1 - s), y: (h / 2) * (1 - s) };
+}
+
 export default function App() {
   const [images, setImages] = useState<ImageEntry[]>([]);
   const [dirName, setDirName] = useState('');
@@ -37,9 +50,11 @@ export default function App() {
   const [mode, setMode] = useState<ReaderMode>('scroll');
   const [currentIndex, setCurrentIndex] = useState(0);
   const [barsVisible, setBarsVisible] = useState(true);
-  const [zoom, setZoom] = useState(1);
-  const [origin, setOrigin] = useState('50% 50%');
-  const [offset, setOffset] = useState({ x: 0, y: 0 });
+  const [dirVisible, setDirVisible] = useState(true);
+  // 单/双页视图：s=缩放比例，x/y=平移量（相对 stage 内容区左上角，transform-origin 固定为左上角）
+  const [view, setView] = useState({ s: 1, x: 0, y: 0 });
+  // 下拉滚动的阅读进度百分比
+  const [scrollProgress, setScrollProgress] = useState(0);
 
   // 已存句柄但权限待确认时，展示「重新授权」
   const [storedHandle, setStoredHandle] = useState<FileSystemDirectoryHandle | null>(null);
@@ -64,7 +79,7 @@ export default function App() {
         return doubleIndices(prevSpread, images.length)[0] ?? 0;
       });
     }
-    setOffset({ x: 0, y: 0 });
+    setView((v) => ({ s: v.s, ...centeredOffset(stageRef.current, v.s) }));
   }, [mode, images.length]);
 
   const goNext = useCallback(() => {
@@ -76,7 +91,7 @@ export default function App() {
         return doubleIndices(nextSpread, images.length)[0] ?? i;
       });
     }
-    setOffset({ x: 0, y: 0 });
+    setView((v) => ({ s: v.s, ...centeredOffset(stageRef.current, v.s) }));
   }, [mode, images.length]);
 
   // 初始化配置 + 自动恢复最近文件夹
@@ -92,7 +107,7 @@ export default function App() {
     setMode(cfg.defaultMode);
     if (cfg.zoomDefault === 'memory') {
       const z = await loadLastZoom();
-      if (z !== undefined) setZoom(clampZoom(z));
+      if (z !== undefined) setView((v) => ({ ...v, s: clampZoom(z) }));
     }
     await restoreLastDir();
   }
@@ -100,9 +115,9 @@ export default function App() {
   // 记忆上次缩放
   useEffect(() => {
     if (config.zoomDefault === 'memory') {
-      void saveLastZoom(zoom);
+      void saveLastZoom(view.s);
     }
-  }, [zoom, config.zoomDefault]);
+  }, [view.s, config.zoomDefault]);
 
   // 配置实时同步（主题/语言/快捷键等）
   useEffect(() => {
@@ -131,7 +146,14 @@ export default function App() {
     function onKeyDown(e: KeyboardEvent) {
       const hideKey = (config.hideKey || 'f').toLowerCase();
       if (e.key.toLowerCase() === hideKey) {
-        setBarsVisible((v) => !v);
+        // 沉浸模式：隐藏状态栏时一并隐藏目录，显示时一并恢复
+        const next = !barsVisible;
+        setBarsVisible(next);
+        setDirVisible(next);
+        return;
+      }
+      if (e.key.toLowerCase() === 'd') {
+        setDirVisible((v) => !v);
         return;
       }
       if (mode === 'scroll') return;
@@ -145,7 +167,7 @@ export default function App() {
     }
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [config.hideKey, mode, goPrev, goNext]);
+  }, [config.hideKey, mode, goPrev, goNext, barsVisible]);
 
   // 滚轮：Ctrl+滚轮缩放（以鼠标为中心），普通滚轮翻页；原生监听支持 preventDefault
   useEffect(() => {
@@ -155,14 +177,23 @@ export default function App() {
       if (e.ctrlKey) {
         e.preventDefault();
         const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
-        if (mode !== 'scroll') {
-          const zoomable = (e.target as HTMLElement).closest?.('.zoomable') as HTMLElement | null;
-          if (zoomable) {
-            const rect = zoomable.getBoundingClientRect();
-            setOrigin(`${e.clientX - rect.left}px ${e.clientY - rect.top}px`);
-          }
+        if (mode === 'scroll') {
+          setView((v) => ({ ...v, s: clampZoom(v.s * factor) }));
+          return;
         }
-        setZoom((z) => clampZoom(z * factor));
+        // 单/双页：以鼠标点为中心缩放（固定左上角原点 + 精确平移补偿，避免锚点漂移）
+        const stageEl = stageRef.current;
+        if (!stageEl) return;
+        const sr = stageEl.getBoundingClientRect();
+        const cs = getComputedStyle(stageEl);
+        const mx = e.clientX - (sr.left + (parseFloat(cs.paddingLeft) || 0));
+        const my = e.clientY - (sr.top + (parseFloat(cs.paddingTop) || 0));
+        setView((v) => {
+          const s2 = clampZoom(v.s * factor);
+          const cx = (mx - v.x) / v.s;
+          const cy = (my - v.y) / v.s;
+          return { s: s2, x: mx - s2 * cx, y: my - s2 * cy };
+        });
         return;
       }
       if (mode === 'scroll') return;
@@ -182,10 +213,11 @@ export default function App() {
     function onMove(e: MouseEvent) {
       const drag = dragRef.current;
       if (!drag) return;
-      setOffset({
+      setView((v) => ({
+        ...v,
         x: drag.originX + (e.clientX - drag.startX),
         y: drag.originY + (e.clientY - drag.startY),
-      });
+      }));
     }
     function onUp() {
       dragRef.current = null;
@@ -219,6 +251,28 @@ export default function App() {
     return () => io.disconnect();
   }, [mode, status, images]);
 
+  // 记忆阅读位置：同一文件夹下次打开恢复到上次所在图片
+  useEffect(() => {
+    if (dirName && status === 'ready') {
+      void saveLastPosition({ dir: dirName, index: currentIndex });
+    }
+  }, [currentIndex, dirName, status]);
+
+  // 下拉滚动模式：计算阅读进度百分比
+  useEffect(() => {
+    if (mode !== 'scroll' || status !== 'ready') return;
+    const el = stageRef.current;
+    if (!el) return;
+    const onScroll = () => {
+      const max = el.scrollHeight - el.clientHeight;
+      const p = max > 0 ? Math.round((el.scrollTop / max) * 100) : 100;
+      setScrollProgress(Math.max(0, Math.min(100, p)));
+    };
+    el.addEventListener('scroll', onScroll, { passive: true });
+    onScroll();
+    return () => el.removeEventListener('scroll', onScroll);
+  }, [mode, status, images]);
+
   async function restoreLastDir() {
     const handle = await loadLastDir();
     if (!handle) return;
@@ -239,8 +293,19 @@ export default function App() {
       setImages(result.images);
       setHasSubfolders(result.hasSubfolders);
       setDirName(handle.name);
-      setCurrentIndex(0);
+      // 恢复上次阅读位置（仅当同一文件夹且索引有效）
+      let startIndex = 0;
+      const pos = await loadLastPosition();
+      if (pos && pos.dir === handle.name && pos.index >= 0 && pos.index < result.images.length) {
+        startIndex = pos.index;
+      }
+      setCurrentIndex(startIndex);
       setStatus('ready');
+      if (startIndex > 0) {
+        window.setTimeout(() => {
+          document.getElementById(`img-${startIndex}`)?.scrollIntoView({ block: 'start' });
+        }, 120);
+      }
     } catch (e) {
       setStatus('error');
       setError(String(e));
@@ -273,17 +338,31 @@ export default function App() {
   function selectMode(next: ReaderMode) {
     setMode(next);
     setCurrentIndex((i) => Math.min(i, Math.max(images.length - 1, 0)));
-    setOffset({ x: 0, y: 0 });
+    setView((v) => ({ s: v.s, ...centeredOffset(stageRef.current, v.s) }));
   }
 
   function resetZoom() {
-    setZoom(1);
-    setOrigin('50% 50%');
-    setOffset({ x: 0, y: 0 });
+    setView({ s: 1, x: 0, y: 0 });
+  }
+
+  function toggleTheme() {
+    const next: ReaderConfig['theme'] = config.theme === 'dark' ? 'light' : 'dark';
+    const apply = () => {
+      document.documentElement.dataset.theme = next;
+      const nextCfg = { ...config, theme: next };
+      setConfig(nextCfg);
+      void saveConfig(nextCfg);
+    };
+    const doc = document as Document & { startViewTransition?: (cb: () => void) => void };
+    if (typeof doc.startViewTransition === 'function') {
+      doc.startViewTransition(apply);
+    } else {
+      apply();
+    }
   }
 
   function onStageClick(e: React.MouseEvent) {
-    if (mode === 'scroll' || zoom !== 1) return;
+    if (mode === 'scroll' || view.s !== 1) return;
     const stage = stageRef.current;
     if (!stage) return;
     const rect = stage.getBoundingClientRect();
@@ -301,12 +380,12 @@ export default function App() {
   }
 
   function onZoomableMouseDown(e: React.MouseEvent) {
-    if (mode === 'scroll' || zoom <= 1) return;
+    if (mode === 'scroll' || view.s <= 1) return;
     dragRef.current = {
       startX: e.clientX,
       startY: e.clientY,
-      originX: offset.x,
-      originY: offset.y,
+      originX: view.x,
+      originY: view.y,
     };
     e.preventDefault();
   }
@@ -329,7 +408,7 @@ export default function App() {
   const pageInfo = (() => {
     if (mode === 'single') return `${currentIndex + 1} / ${images.length}`;
     if (mode === 'double') return `${currentSpread + 1} / ${spreadCount}`;
-    return t(lang, 'imageCount', { n: images.length });
+    return `${scrollProgress}%`;
   })();
 
   // 目录栏高亮索引集合：双页模式高亮整屏，其余模式高亮当前项
@@ -344,6 +423,13 @@ export default function App() {
         <header className="toolbar">
           <button className="toolbar__import" onClick={importFolder}>
             {t(lang, 'importFolder')}
+          </button>
+          <button
+            className="toolbar__dir"
+            title={t(lang, 'dirHint')}
+            onClick={() => setDirVisible((v) => !v)}
+          >
+            {t(lang, dirVisible ? 'hideDir' : 'showDir')}
           </button>
           {reauthNeeded && (
             <button className="toolbar__reauth" onClick={() => void reauthorize()}>
@@ -369,9 +455,20 @@ export default function App() {
           </button>
 
           <button
+            className="toolbar__theme"
+            title={t(lang, 'themeToggle')}
+            onClick={toggleTheme}
+          >
+            {config.theme === 'dark' ? '☀' : '☾'}
+          </button>
+
+          <button
             className="toolbar__hide"
             title={t(lang, 'hide')}
-            onClick={() => setBarsVisible(false)}
+            onClick={() => {
+              setBarsVisible(false);
+              setDirVisible(false);
+            }}
           >
             {t(lang, 'hide')}
           </button>
@@ -379,7 +476,7 @@ export default function App() {
       )}
 
       <div className="reader__body">
-        <aside className="dirlist">
+        <aside className={`dirlist${dirVisible ? '' : ' dirlist--hidden'}`}>
           {status === 'loading' && <p className="hint">{t(lang, 'loading')}</p>}
           {status === 'idle' && <p className="hint">{t(lang, 'importPrompt')}</p>}
           {status === 'ready' && images.length === 0 && <p className="hint">{t(lang, 'noImages')}</p>}
@@ -410,7 +507,7 @@ export default function App() {
           {status === 'ready' && mode === 'scroll' && (
             <div ref={scrollRef} className="scroll">
               {images.map((img, index) => (
-                <div key={img.name} id={`img-${index}`} data-index={index} className="scroll__item" style={{ zoom }}>
+                <div key={img.name} id={`img-${index}`} data-index={index} className="scroll__item" style={{ zoom: view.s }}>
                   <ImageItem fileHandle={img.fileHandle} alt={img.name} lazy />
                 </div>
               ))}
@@ -421,9 +518,9 @@ export default function App() {
             <div
               className="single zoomable"
               style={{
-                transform: `translate(${offset.x}px, ${offset.y}px) scale(${zoom})`,
-                transformOrigin: origin,
-                cursor: zoom > 1 ? 'grab' : undefined,
+                transform: `translate(${view.x}px, ${view.y}px) scale(${view.s})`,
+                transformOrigin: '0 0',
+                cursor: view.s > 1 ? 'grab' : undefined,
               }}
               onMouseDown={onZoomableMouseDown}
             >
@@ -440,9 +537,9 @@ export default function App() {
             <div
               className="double zoomable"
               style={{
-                transform: `translate(${offset.x}px, ${offset.y}px) scale(${zoom})`,
-                transformOrigin: origin,
-                cursor: zoom > 1 ? 'grab' : undefined,
+                transform: `translate(${view.x}px, ${view.y}px) scale(${view.s})`,
+                transformOrigin: '0 0',
+                cursor: view.s > 1 ? 'grab' : undefined,
               }}
               onMouseDown={onZoomableMouseDown}
             >
@@ -462,7 +559,7 @@ export default function App() {
         <footer className="statusbar">
           <span className="statusbar__page">{pageInfo}</span>
           <span className="statusbar__name">{currentNames.filter(Boolean).join(' ｜ ')}</span>
-          <span className="statusbar__zoom">{Math.round(zoom * 100)}%</span>
+          <span className="statusbar__zoom">{Math.round(view.s * 100)}%</span>
         </footer>
       )}
 

@@ -30,6 +30,16 @@
   --error-text: #f8a5a5;
 }
 
+/* 主题切换平滑过渡 */
+.reader,
+.toolbar,
+.statusbar,
+.dirlist,
+.stage,
+.mode-btn {
+  transition: background-color 0.3s ease, color 0.3s ease, border-color 0.3s ease;
+}
+
 html,
 body,
 #root {
@@ -78,11 +88,11 @@ body,
   background: transparent;
   color: var(--text-dim);
   border: 1px solid var(--border);
-  margin-left: auto;
 }
 
 .toolbar__reauth,
-.toolbar__restore {
+.toolbar__restore,
+.toolbar__dir {
   padding: 7px 14px;
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -94,7 +104,28 @@ body,
 }
 
 .toolbar__reauth:hover,
-.toolbar__restore:hover {
+.toolbar__restore:hover,
+.toolbar__dir:hover {
+  background: var(--hover);
+}
+
+.toolbar__theme {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.toolbar__theme:hover {
   background: var(--hover);
 }
 
@@ -139,6 +170,7 @@ body,
   display: flex;
   flex: 1;
   min-height: 0;
+  overflow: hidden;
 }
 
 /* 左侧目录 */
@@ -148,6 +180,11 @@ body,
   overflow-y: auto;
   background: var(--panel);
   border-right: 1px solid var(--border);
+  transition: margin-left 0.22s ease;
+}
+
+.dirlist--hidden {
+  margin-left: -220px;
 }
 
 .dirlist__items {
@@ -201,6 +238,7 @@ body,
 .stage--single,
 .stage--double {
   cursor: pointer;
+  overflow: hidden;
 }
 
 .stage__empty {
@@ -274,11 +312,11 @@ body,
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 12px;
+  gap: 16px;
 }
 
 .double__page {
-  flex: 1;
+  flex: 0 1 auto;
   min-width: 0;
   height: 100%;
   display: flex;

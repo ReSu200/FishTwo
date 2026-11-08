@@ -1,29 +1,8 @@
 import { useEffect, useState } from 'react';
-import {
-  DEFAULT_CONFIG,
-  loadConfig,
-  saveConfig,
-  type ReaderConfig,
-  type ReaderMode,
-  type Theme,
-  type ZoomDefault,
-} from '@/utils/config';
+import { DEFAULT_CONFIG, loadConfig, saveConfig, type ReaderConfig } from '@/utils/config';
 import { resolveLang, t, type Lang, type LangSetting } from '@/utils/i18n';
-import { loadLastDir } from '@/utils/db';
+import { loadDirHistory, saveLastDir } from '@/utils/db';
 
-const MODE_OPTIONS: { value: ReaderMode; key: string }[] = [
-  { value: 'scroll', key: 'modeScroll' },
-  { value: 'single', key: 'modeSingle' },
-  { value: 'double', key: 'modeDouble' },
-];
-const THEME_OPTIONS: { value: Theme; key: string }[] = [
-  { value: 'light', key: 'themeLight' },
-  { value: 'dark', key: 'themeDark' },
-];
-const ZOOM_OPTIONS: { value: ZoomDefault; key: string }[] = [
-  { value: 'fixed', key: 'zoomFixed' },
-  { value: 'memory', key: 'zoomMemory' },
-];
 const LANG_OPTIONS: { value: LangSetting; key: string }[] = [
   { value: 'system', key: 'langSystem' },
   { value: 'zh', key: 'langZh' },
@@ -32,13 +11,12 @@ const LANG_OPTIONS: { value: LangSetting; key: string }[] = [
 
 export default function App() {
   const [config, setConfig] = useState<ReaderConfig>(DEFAULT_CONFIG);
-  const [recentName, setRecentName] = useState<string | null>(null);
+  const [history, setHistory] = useState<FileSystemDirectoryHandle[]>([]);
 
   useEffect(() => {
     void (async () => {
       setConfig(await loadConfig());
-      const handle = await loadLastDir();
-      setRecentName(handle?.name ?? null);
+      setHistory(await loadDirHistory());
     })();
   }, []);
 
@@ -56,6 +34,16 @@ export default function App() {
     } catch (e) {
       console.error('Failed to open reader', e);
     }
+  }
+
+  async function openDir(handle: FileSystemDirectoryHandle) {
+    try {
+      // 置顶为最近打开，阅读器打开时会自动恢复该目录
+      await saveLastDir(handle);
+    } catch (e) {
+      console.error(e);
+    }
+    openReader();
   }
 
   return (
@@ -83,51 +71,6 @@ export default function App() {
       </div>
 
       <div className="field">
-        <label className="field__label">{t(lang, 'defaultMode')}</label>
-        <select
-          className="field__select"
-          value={config.defaultMode}
-          onChange={(e) => void update({ defaultMode: e.target.value as ReaderMode })}
-        >
-          {MODE_OPTIONS.map((o) => (
-            <option key={o.value} value={o.value}>
-              {t(lang, o.key)}
-            </option>
-          ))}
-        </select>
-      </div>
-
-      <div className="field">
-        <label className="field__label">{t(lang, 'theme')}</label>
-        <select
-          className="field__select"
-          value={config.theme}
-          onChange={(e) => void update({ theme: e.target.value as Theme })}
-        >
-          {THEME_OPTIONS.map((o) => (
-            <option key={o.value} value={o.value}>
-              {t(lang, o.key)}
-            </option>
-          ))}
-        </select>
-      </div>
-
-      <div className="field">
-        <label className="field__label">{t(lang, 'defaultZoom')}</label>
-        <select
-          className="field__select"
-          value={config.zoomDefault}
-          onChange={(e) => void update({ zoomDefault: e.target.value as ZoomDefault })}
-        >
-          {ZOOM_OPTIONS.map((o) => (
-            <option key={o.value} value={o.value}>
-              {t(lang, o.key)}
-            </option>
-          ))}
-        </select>
-      </div>
-
-      <div className="field">
         <label className="field__label">{t(lang, 'hideKeyLabel')}</label>
         <input
           className="field__input"
@@ -139,13 +82,19 @@ export default function App() {
 
       <div className="recent">
         <div className="recent__label">{t(lang, 'recentFolders')}</div>
-        {recentName ? (
-          <div className="recent__row">
-            <span className="recent__name">{recentName}</span>
-            <button className="recent__open" onClick={openReader}>
-              {t(lang, 'open')}
-            </button>
-          </div>
+        {history.length > 0 ? (
+          <ul className="recent__list">
+            {history.map((h, i) => (
+              <li key={`${h.name}-${i}`} className="recent__row">
+                <span className="recent__name" title={h.name}>
+                  {h.name}
+                </span>
+                <button className="recent__open" onClick={() => void openDir(h)}>
+                  {t(lang, 'open')}
+                </button>
+              </li>
+            ))}
+          </ul>
         ) : (
           <div className="recent__none">{t(lang, 'recentNone')}</div>
         )}

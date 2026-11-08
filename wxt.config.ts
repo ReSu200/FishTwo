@@ -8,6 +8,7 @@ export default defineConfig({
     description: '__MSG_extDescription__',
     default_locale: 'zh_CN',
     version: '0.0.3',
+    permissions: ['storage'],
     action: {
       default_icon: {
         16: '/icons/16.png',

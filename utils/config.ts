@@ -24,6 +24,12 @@ export const DEFAULT_CONFIG: ReaderConfig = {
 
 const CONFIG_KEY = 'config';
 const LAST_ZOOM_KEY = 'lastZoom';
+const LAST_POS_KEY = 'lastPosition';
+
+export interface ReadingPosition {
+  dir: string;
+  index: number;
+}
 
 /**
  * 安全获取 storage 区域。
@@ -81,6 +87,30 @@ export async function saveLastZoom(zoom: number): Promise<void> {
   if (!area) return;
   try {
     await area.set({ [LAST_ZOOM_KEY]: zoom });
+  } catch {
+    /* ignore */
+  }
+}
+
+/** 读取上次阅读位置（文件夹名 + 图片索引） */
+export async function loadLastPosition(): Promise<ReadingPosition | undefined> {
+  const area = getStorageArea('local');
+  if (!area) return undefined;
+  try {
+    const stored = await area.get(LAST_POS_KEY);
+    const v = stored?.[LAST_POS_KEY] as ReadingPosition | undefined;
+    if (v && typeof v.dir === 'string' && typeof v.index === 'number') return v;
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export async function saveLastPosition(pos: ReadingPosition): Promise<void> {
+  const area = getStorageArea('local');
+  if (!area) return;
+  try {
+    await area.set({ [LAST_POS_KEY]: pos });
   } catch {
     /* ignore */
   }

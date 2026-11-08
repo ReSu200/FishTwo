@@ -83,6 +83,15 @@
   margin-bottom: 8px;
 }
 
+.recent__list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
 .recent__row {
   display: flex;
   align-items: center;
