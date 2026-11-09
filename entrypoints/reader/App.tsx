@@ -8,11 +8,11 @@ import Logo from '@/components/Logo';
 import {
   DEFAULT_CONFIG,
   loadConfig,
-  loadLastPosition,
   loadLastZoom,
+  loadPosition,
   saveConfig,
-  saveLastPosition,
   saveLastZoom,
+  savePosition,
   type ReaderConfig,
   type ReaderMode,
 } from '@/utils/config';
@@ -329,10 +329,10 @@ export default function App() {
     };
   }, [mode, status, images]);
 
-  // 记忆阅读位置：同一文件夹下次打开恢复到上次所在图片
+  // 记忆阅读位置：同一文件夹下次打开恢复到上次所在图片（按文件夹分别存储）
   useEffect(() => {
     if (dirName && status === 'ready') {
-      void saveLastPosition({ dir: dirName, index: currentIndex });
+      void savePosition(dirName, currentIndex);
     }
   }, [currentIndex, dirName, status]);
 
@@ -378,11 +378,11 @@ export default function App() {
       setImages(result.images);
       setHasSubfolders(result.hasSubfolders);
       setDirName(handle.name);
-      // 恢复上次阅读位置（仅当同一文件夹且索引有效）
+      // 恢复该文件夹上次阅读位置（索引有效时）
       let startIndex = 0;
-      const pos = await loadLastPosition();
-      if (pos && pos.dir === handle.name && pos.index >= 0 && pos.index < result.images.length) {
-        startIndex = pos.index;
+      const saved = await loadPosition(handle.name);
+      if (typeof saved === 'number' && saved >= 0 && saved < result.images.length) {
+        startIndex = saved;
       }
       setCurrentIndex(startIndex);
       setStatus('ready');

@@ -26,10 +26,8 @@ const CONFIG_KEY = 'config';
 const LAST_ZOOM_KEY = 'lastZoom';
 const LAST_POS_KEY = 'lastPosition';
 
-export interface ReadingPosition {
-  dir: string;
-  index: number;
-}
+/** 各文件夹的阅读位置（文件夹名 → 图片索引） */
+export type ReadingPositions = Record<string, number>;
 
 /**
  * 安全获取 storage 区域。
@@ -92,25 +90,38 @@ export async function saveLastZoom(zoom: number): Promise<void> {
   }
 }
 
-/** 读取上次阅读位置（文件夹名 + 图片索引） */
-export async function loadLastPosition(): Promise<ReadingPosition | undefined> {
+// 阅读位置按文件夹名分别存储，避免切换文件夹时互相覆盖（内存缓存避免读改写竞态）
+let posCache: ReadingPositions | undefined;
+
+async function getPositions(): Promise<ReadingPositions> {
+  if (posCache) return posCache;
   const area = getStorageArea('local');
-  if (!area) return undefined;
+  if (!area) return (posCache = {});
   try {
     const stored = await area.get(LAST_POS_KEY);
-    const v = stored?.[LAST_POS_KEY] as ReadingPosition | undefined;
-    if (v && typeof v.dir === 'string' && typeof v.index === 'number') return v;
-    return undefined;
+    const v = stored?.[LAST_POS_KEY];
+    posCache = v && typeof v === 'object' ? { ...(v as ReadingPositions) } : {};
   } catch {
-    return undefined;
+    posCache = {};
   }
+  return posCache;
 }
 
-export async function saveLastPosition(pos: ReadingPosition): Promise<void> {
+/** 读取指定文件夹上次阅读到的图片索引 */
+export async function loadPosition(dir: string): Promise<number | undefined> {
+  const map = await getPositions();
+  return typeof map[dir] === 'number' ? map[dir] : undefined;
+}
+
+/** 保存指定文件夹的阅读位置（图片索引） */
+export async function savePosition(dir: string, index: number): Promise<void> {
+  const map = await getPositions();
+  if (map[dir] === index) return;
+  map[dir] = index;
   const area = getStorageArea('local');
   if (!area) return;
   try {
-    await area.set({ [LAST_POS_KEY]: pos });
+    await area.set({ [LAST_POS_KEY]: { ...map } });
   } catch {
     /* ignore */
   }
