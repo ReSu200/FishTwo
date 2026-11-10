@@ -1,9 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
 import {
   DEFAULT_CONFIG,
+  DEFAULT_SHORTCUTS,
+  isReservedShortcutKey,
   loadConfig,
+  normalizeShortcuts,
   saveConfig,
   type ReaderConfig,
+  type ShortcutAction,
   type Theme,
 } from '@/utils/config';
 import { resolveLang, t, type Lang, type LangSetting } from '@/utils/i18n';
@@ -22,14 +26,34 @@ const THEME_OPTIONS: { value: Theme; key: string; icon: 'sun' | 'moon' }[] = [
   { value: 'dark', key: 'themeDark', icon: 'moon' },
 ];
 
+const MODE_OPTIONS: { value: ReaderConfig['defaultMode']; key: string }[] = [
+  { value: 'scroll', key: 'modeScroll' },
+  { value: 'single', key: 'modeSingle' },
+  { value: 'double', key: 'modeDouble' },
+];
+
+const ZOOM_OPTIONS: { value: ReaderConfig['zoomDefault']; key: string }[] = [
+  { value: 'fixed', key: 'zoomFixed' },
+  { value: 'memory', key: 'zoomMemory' },
+];
+
+const SHORTCUT_ROWS: { action: ShortcutAction; labelKey: string }[] = [
+  { action: 'dir', labelKey: 'shortcutDir' },
+  { action: 'immersive', labelKey: 'shortcutImmersive' },
+  { action: 'fullscreen', labelKey: 'shortcutFullscreen' },
+];
+
 export default function App() {
   const [config, setConfig] = useState<ReaderConfig>(DEFAULT_CONFIG);
   const [history, setHistory] = useState<FileSystemDirectoryHandle[]>([]);
   const [version, setVersion] = useState('');
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const [conflictKey, setConflictKey] = useState('');
 
   useEffect(() => {
     void (async () => {
       const cfg = await loadConfig();
+      configRef.current = cfg;
       setConfig(cfg);
       setHistory(await loadDirHistory());
     })();
@@ -57,14 +81,21 @@ export default function App() {
     if (!onChanged) return;
     function listener(changes: Record<string, unknown>) {
       const next = (changes['config'] as { newValue?: ReaderConfig } | undefined)?.newValue;
-      if (next) setConfig(next);
+      if (next) {
+        const safe: ReaderConfig = {
+          ...next,
+          shortcuts: normalizeShortcuts(next.shortcuts, next.hideKey),
+        };
+        configRef.current = safe;
+        setConfig(safe);
+      }
     }
     onChanged.addListener(listener);
     return () => onChanged.removeListener(listener);
   }, []);
 
   const lang: Lang = resolveLang(config.lang);
-  const hideKey = (config.hideKey || 'f').toUpperCase();
+  const immersiveKey = (config.shortcuts.immersive || 'f').toUpperCase();
 
   // 用 ref 持有最新配置：连续修改（如逐字输入快捷键）时不依赖渲染期闭包，避免丢失字段
   const configRef = useRef(config);
@@ -77,6 +108,22 @@ export default function App() {
     configRef.current = next;
     setConfig(next);
     await saveConfig(next);
+  }
+
+  function changeShortcut(action: ShortcutAction, raw: string) {
+    const key = raw.replace(/[^a-zA-Z]/g, '').slice(0, 1).toLowerCase();
+    if (!key) return;
+    if (isReservedShortcutKey(key)) {
+      setConflictKey(key);
+      return;
+    }
+    const current = configRef.current.shortcuts;
+    if (SHORTCUT_ROWS.some((row) => row.action !== action && current[row.action] === key)) {
+      setConflictKey(key);
+      return;
+    }
+    setConflictKey('');
+    void update({ shortcuts: { ...current, [action]: key } });
   }
 
   function openReader() {
@@ -161,19 +208,95 @@ export default function App() {
         </div>
 
         <div className="row">
-          <span className="row__label">{t(lang, 'hideKeyLabel')}</span>
-          <input
-            className="keycap"
-            value={config.hideKey}
-            maxLength={1}
-            aria-label={t(lang, 'hideKeyLabel')}
-            onChange={(e) => {
-              const v = e.target.value.replace(/[^a-zA-Z]/g, '').slice(0, 1);
-              void update({ hideKey: v || 'f' });
-            }}
-          />
+          <span className="row__label">{t(lang, 'defaultMode')}</span>
+          <div className="select">
+            <select
+              className="select__input"
+              value={config.defaultMode}
+              onChange={(e) =>
+                void update({ defaultMode: e.target.value as ReaderConfig['defaultMode'] })
+              }
+              aria-label={t(lang, 'defaultMode')}
+            >
+              {MODE_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {t(lang, o.key)}
+                </option>
+              ))}
+            </select>
+            <Icon className="select__arrow" name="chevronDown" size={14} />
+          </div>
         </div>
-        <p className="row__hint">{t(lang, 'hideKeyHint')}</p>
+
+        <div className="row">
+          <span className="row__label">{t(lang, 'defaultZoom')}</span>
+          <div className="select">
+            <select
+              className="select__input"
+              value={config.zoomDefault}
+              onChange={(e) =>
+                void update({ zoomDefault: e.target.value as ReaderConfig['zoomDefault'] })
+              }
+              aria-label={t(lang, 'defaultZoom')}
+            >
+              {ZOOM_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {t(lang, o.key)}
+                </option>
+              ))}
+            </select>
+            <Icon className="select__arrow" name="chevronDown" size={14} />
+          </div>
+        </div>
+
+        <button
+          className="group__toggle"
+          onClick={() => {
+            setShortcutsOpen((v) => !v);
+            setConflictKey('');
+          }}
+          aria-expanded={shortcutsOpen}
+        >
+          <span className="group__title">{t(lang, 'shortcutsTitle')}</span>
+          <Icon
+            className={`group__chev${shortcutsOpen ? ' group__chev--open' : ''}`}
+            name="chevronDown"
+            size={14}
+          />
+        </button>
+
+        {shortcutsOpen && (
+          <div className="shortcut-list">
+            {SHORTCUT_ROWS.map((row) => (
+              <div className="row" key={row.action}>
+                <span className="row__label">{t(lang, row.labelKey)}</span>
+                <input
+                  className="keycap"
+                  value={config.shortcuts[row.action].toUpperCase()}
+                  maxLength={1}
+                  aria-label={t(lang, row.labelKey)}
+                  onChange={(e) => changeShortcut(row.action, e.target.value)}
+                />
+              </div>
+            ))}
+            {conflictKey && (
+              <p className="row__hint row__hint--warn">
+                {t(lang, 'shortcutConflict', { key: conflictKey.toUpperCase() })}
+              </p>
+            )}
+            <p className="row__hint">{t(lang, 'shortcutReserved')}</p>
+            <p className="row__hint">{t(lang, 'shortcutHint')}</p>
+            <button
+              className="shortcut-reset"
+              onClick={() => {
+                setConflictKey('');
+                void update({ shortcuts: { ...DEFAULT_SHORTCUTS } });
+              }}
+            >
+              {t(lang, 'shortcutReset')}
+            </button>
+          </div>
+        )}
       </section>
 
       <section className="group group--recent">
@@ -200,7 +323,7 @@ export default function App() {
       </section>
 
       <footer className="popup__foot">
-        <span>{t(lang, 'footerHint', { key: hideKey })}</span>
+        <span>{t(lang, 'footerHint', { key: immersiveKey })}</span>
       </footer>
     </div>
   );

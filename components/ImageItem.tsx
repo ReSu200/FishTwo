@@ -5,10 +5,12 @@ interface ImageItemProps {
   alt: string;
   /** 懒加载：仅在进入视口附近时才读取文件并创建 object URL（用于下拉滚动） */
   lazy?: boolean;
+  /** 图片加载完成后上报自然尺寸（用于旋转后的尺寸适配） */
+  onSize?: (name: string, width: number, height: number) => void;
 }
 
 /** 渲染单张图片：按需读取文件并创建 object URL，卸载时回收；支持视口懒加载 */
-function ImageItem({ fileHandle, alt, lazy = false }: ImageItemProps) {
+function ImageItem({ fileHandle, alt, lazy = false, onSize }: ImageItemProps) {
   const [url, setUrl] = useState('');
   const [failed, setFailed] = useState(false);
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -66,7 +68,18 @@ function ImageItem({ fileHandle, alt, lazy = false }: ImageItemProps) {
     return <div ref={hostRef} className="image-item--loading" role="img" aria-label={alt} />;
   }
 
-  return <img className="image-item" src={url} alt={alt} draggable={false} />;
+  return (
+    <img
+      className="image-item"
+      src={url}
+      alt={alt}
+      draggable={false}
+      onLoad={(e) => {
+        const img = e.currentTarget;
+        onSize?.(alt, img.naturalWidth, img.naturalHeight);
+      }}
+    />
+  );
 }
 
 export default memo(ImageItem);

@@ -5,6 +5,11 @@ interface FileSystemDirectoryHandle {
   requestPermission(descriptor?: { mode?: 'read' | 'readwrite' }): Promise<PermissionState>;
 }
 
+// 拖入目录：Chromium / Edge 支持从 DataTransferItem 直接获取文件系统句柄
+interface DataTransferItem {
+  getAsFileSystemHandle?: () => Promise<FileSystemHandle | null>;
+}
+
 interface Window {
   showDirectoryPicker(options?: {
     id?: string;

@@ -1,22 +1,28 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { scanTopLevelImages, type ImageEntry } from '@/utils/files';
+import { scanTopLevelImages, type ImageEntry, type ScanResult } from '@/utils/files';
 import { saveLastDir, loadLastDir } from '@/utils/db';
 import { doubleSpreadCount, spreadOfIndex, doubleIndices } from '@/utils/paging';
 import ImageItem from '@/components/ImageItem';
 import ScrollList from '@/components/ScrollList';
+import Thumbnail from '@/components/Thumbnail';
 import Icon, { type IconName } from '@/components/Icon';
 import Logo from '@/components/Logo';
 import {
   DEFAULT_CONFIG,
+  clampZoom,
   loadConfig,
+  loadFolderState,
   loadLastZoom,
-  loadPosition,
+  normalizeShortcuts,
   saveConfig,
+  saveFolderState,
   saveLastZoom,
-  savePosition,
+  type FolderState,
   type ReaderConfig,
   type ReaderMode,
 } from '@/utils/config';
+import { extractDirectoryHandle, supportsDirectoryDrop } from '@/utils/drop';
+import { clearThumbs, thumbKey } from '@/utils/thumbs';
 import { resolveLang, t, type Lang } from '@/utils/i18n';
 
 type Status = 'idle' | 'loading' | 'ready' | 'error';
@@ -27,12 +33,8 @@ const MODES: { key: ReaderMode; labelKey: string; icon: IconName }[] = [
   { key: 'double', labelKey: 'modeDouble', icon: 'modeDouble' },
 ];
 
-const MIN_ZOOM = 0.1;
-const MAX_ZOOM = 5;
-const clampZoom = (v: number) => Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, v));
-
 // 目录栏虚拟滚动参数（与 CSS .dirlist__item 的 height 保持一致）
-const DIR_ROW_H = 34;
+const DIR_ROW_H = 48;
 const DIR_OVERSCAN = 6;
 
 /** 空状态插画：静态内容，提到模块级避免每次渲染重建 */
@@ -56,6 +58,50 @@ interface View {
   s: number;
   x: number;
   y: number;
+}
+
+interface NaturalSize {
+  w: number;
+  h: number;
+}
+
+interface Size2D {
+  w: number;
+  h: number;
+}
+
+/**
+ * 计算旋转后不越界的「未旋转显示尺寸」。
+ * boxH 为 null 表示仅约束宽度（下拉滚动，高度可滚动）。
+ */
+function fitRotatedSize(
+  natural: NaturalSize,
+  boxW: number,
+  boxH: number | null,
+  rotation: number,
+): Size2D | null {
+  if (!natural || natural.w <= 0 || natural.h <= 0 || boxW <= 0) return null;
+  const ratio = natural.w / natural.h;
+  const rot = ((rotation % 360) + 360) % 360;
+  const swapped = rot === 90 || rot === 270;
+  if (boxH === null) {
+    const w = swapped
+      ? ratio <= 1
+        ? Math.min(natural.w, boxW * ratio)
+        : Math.min(natural.w, boxW)
+      : Math.min(natural.w, boxW);
+    return { w, h: w / ratio };
+  }
+  const w = swapped
+    ? Math.min(natural.w, boxH, boxW * ratio)
+    : Math.min(natural.w, boxW, boxH * ratio);
+  return { w, h: w / ratio };
+}
+
+/** 旋转 90°/270° 时，包围盒宽高互换 */
+function rotatedBox(fit: Size2D, rotation: number): Size2D {
+  const rot = ((rotation % 360) + 360) % 360;
+  return rot === 90 || rot === 270 ? { w: fit.h, h: fit.w } : { w: fit.w, h: fit.h };
 }
 
 /** 计算缩放为 s 时使内容居中所需的平移量（相对 stage 内容区，原点在左上角） */
@@ -103,6 +149,16 @@ export default function App() {
   const [view, setView] = useState<View>({ s: 1, x: 0, y: 0 });
   // 下拉滚动的阅读进度百分比
   const [scrollProgress, setScrollProgress] = useState(0);
+  // 当前会话的图片旋转角度（0 / 90 / 180 / 270），翻页或切换文件夹后复位
+  const [rotation, setRotation] = useState(0);
+  // 图片自然尺寸（按文件名），用于旋转后的尺寸适配
+  const [naturalSizes, setNaturalSizes] = useState<Record<string, NaturalSize>>({});
+  // 舞台内容区尺寸（不含 padding），用于旋转尺寸计算
+  const [stageSize, setStageSize] = useState<Size2D>({ w: 0, h: 0 });
+  // 拖入文件夹时的覆盖层
+  const [dragActive, setDragActive] = useState(false);
+  // 每次导入目录递增，用于强制重建目录项与缩略图（同一文件夹重新授权时也能刷新）
+  const [folderSession, setFolderSession] = useState(0);
 
   // 已存句柄但权限待确认时，展示「重新授权」
   const [storedHandle, setStoredHandle] = useState<FileSystemDirectoryHandle | null>(null);
@@ -119,23 +175,31 @@ export default function App() {
   const viewRef = useRef(view);
   const barsVisibleRef = useRef(barsVisible);
   const hintsOpenRef = useRef(hintsOpen);
-  const hideKeyRef = useRef(config.hideKey);
+  const shortcutsRef = useRef(config.shortcuts);
+  const configRef = useRef(config);
+  const lastZoomRef = useRef<number | undefined>(undefined);
   // 目录跳转的校正序号：用户主动滚动/按键时递增，使未执行的校正失效
   const jumpSeqRef = useRef(0);
-  // 存储写入防抖：滚动/缩放会高频变化，攒一段时间再写，避免每次变化都写 storage
-  const pendingPosRef = useRef<{ dir: string; index: number } | null>(null);
+  // 目录加载序号：快速连续导入时，旧目录的延迟回调不再生效
+  const loadSeqRef = useRef(0);
+  // 存储写入防抖：滚动/缩放/翻页会高频变化，攒一段时间再写，避免每次变化都写 storage
+  const pendingStateRef = useRef<{ dir: string; state: FolderState } | null>(null);
   const pendingZoomRef = useRef<number | null>(null);
+  // 拖入覆盖层的进入计数，避免子元素触发 dragleave 时闪烁
+  const dragDepthRef = useRef(0);
 
   const spreadCount = doubleSpreadCount(images.length);
   const currentSpread = spreadOfIndex(currentIndex);
-  const hideKey = (config.hideKey || 'f').toUpperCase();
+  const shortcuts = config.shortcuts;
+  const immersiveKey = (shortcuts.immersive || 'f').toUpperCase();
 
   // 把最新的 view / 状态栏可见性 / 快捷键同步到 ref，供事件处理器读取
   useEffect(() => {
     viewRef.current = view;
     barsVisibleRef.current = barsVisible;
     hintsOpenRef.current = hintsOpen;
-    hideKeyRef.current = config.hideKey;
+    shortcutsRef.current = config.shortcuts;
+    configRef.current = config;
   });
 
   /** 按当前缩放重新居中（在事件处理器中计算，保持 setView 为纯更新） */
@@ -144,7 +208,42 @@ export default function App() {
     setView({ s, ...centeredOffset(stageRef.current, s) });
   }, []);
 
+  /** 立即落盘尚未写入的文件夹状态（切换文件夹 / 卸载前调用） */
+  const flushPendingState = useCallback(() => {
+    const pending = pendingStateRef.current;
+    if (!pending) return;
+    pendingStateRef.current = null;
+    void saveFolderState(pending.dir, pending.state);
+  }, []);
+
+  /** 图片加载后上报自然尺寸，供旋转尺寸计算 */
+  const onImageSize = useCallback((name: string, w: number, h: number) => {
+    if (!name || w <= 0 || h <= 0) return;
+    setNaturalSizes((prev) => {
+      const current = prev[name];
+      if (current && current.w === w && current.h === h) return prev;
+      return { ...prev, [name]: { w, h } };
+    });
+  }, []);
+
+  const rotateBy = useCallback((delta: number) => {
+    setRotation((r) => (((r + delta) % 360) + 360) % 360);
+  }, []);
+
+  const toggleFullscreen = useCallback(() => {
+    if (document.fullscreenElement) {
+      void document.exitFullscreen().catch(() => {
+        /* 浏览器拒绝时静默失败 */
+      });
+      return;
+    }
+    void document.documentElement.requestFullscreen().catch(() => {
+      /* 无用户手势或被拒绝时静默失败 */
+    });
+  }, []);
+
   const goPrev = useCallback(() => {
+    setRotation(0);
     if (mode === 'single') {
       setCurrentIndex((i) => Math.max(i - 1, 0));
     } else if (mode === 'double') {
@@ -157,6 +256,7 @@ export default function App() {
   }, [mode, images.length, recenter]);
 
   const goNext = useCallback(() => {
+    setRotation(0);
     if (mode === 'single') {
       setCurrentIndex((i) => Math.min(i + 1, images.length - 1));
     } else if (mode === 'double') {
@@ -180,6 +280,8 @@ export default function App() {
       loadLastZoom(),
       loadLastDir(),
     ]);
+    configRef.current = cfg;
+    lastZoomRef.current = z;
     document.documentElement.dataset.theme = cfg.theme;
     setConfig(cfg);
     setLang(resolveLang(cfg.lang));
@@ -193,6 +295,7 @@ export default function App() {
   // 记忆上次缩放（防抖写入：连续 Ctrl+滚轮只写最后一次）
   useEffect(() => {
     if (config.zoomDefault !== 'memory') return;
+    lastZoomRef.current = view.s;
     pendingZoomRef.current = view.s;
     const id = window.setTimeout(() => {
       if (pendingZoomRef.current !== null) void saveLastZoom(pendingZoomRef.current);
@@ -214,9 +317,15 @@ export default function App() {
       const change = changes['config'] as { newValue?: ReaderConfig } | undefined;
       const next = change?.newValue;
       if (!next) return;
-      document.documentElement.dataset.theme = next.theme;
-      setConfig(next);
-      setLang(resolveLang(next.lang));
+      const safe: ReaderConfig = {
+        ...next,
+        shortcuts: normalizeShortcuts(next.shortcuts, next.hideKey),
+      };
+      document.documentElement.dataset.theme = safe.theme;
+      configRef.current = safe;
+      shortcutsRef.current = safe.shortcuts;
+      setConfig(safe);
+      setLang(resolveLang(safe.lang));
     }
     onChanged.addListener(listener);
     return () => onChanged.removeListener(listener);
@@ -227,7 +336,60 @@ export default function App() {
     document.title = `${t(lang, 'name')} · ${t(lang, 'reader')}`;
   }, [lang]);
 
-  // 键盘：翻页 + 隐藏/唤回状态栏 + 快捷键面板
+  // 翻页、切换模式或文件夹后，旋转回到原始方向
+  useEffect(() => {
+    setRotation(0);
+  }, [currentIndex, mode, dirName]);
+
+  // 测量舞台内容区尺寸，供旋转后的尺寸适配
+  useEffect(() => {
+    const el = stageRef.current;
+    if (!el) return;
+    let raf = 0;
+    const measure = () => {
+      raf = 0;
+      const cs = getComputedStyle(el);
+      // clientWidth / clientHeight 不含滚动条，再减去 padding，得到真正的内容区尺寸
+      const w = el.clientWidth - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0);
+      const h = el.clientHeight - (parseFloat(cs.paddingTop) || 0) - (parseFloat(cs.paddingBottom) || 0);
+      setStageSize((prev) =>
+        Math.abs(prev.w - w) < 0.5 && Math.abs(prev.h - h) < 0.5 ? prev : { w, h },
+      );
+    };
+    const schedule = () => {
+      if (!raf) raf = requestAnimationFrame(measure);
+    };
+    schedule();
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(schedule) : null;
+    ro?.observe(el);
+    window.addEventListener('resize', schedule);
+    return () => {
+      ro?.disconnect();
+      window.removeEventListener('resize', schedule);
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [mode, dirVisible]);
+
+  // 阻止把文件拖到舞台外时浏览器直接打开文件；拖拽结束时兜底关闭覆盖层
+  useEffect(() => {
+    const prevent = (e: DragEvent) => {
+      if (e.dataTransfer?.types.includes('Files')) e.preventDefault();
+    };
+    const reset = () => {
+      dragDepthRef.current = 0;
+      setDragActive(false);
+    };
+    window.addEventListener('dragover', prevent);
+    window.addEventListener('drop', prevent);
+    window.addEventListener('dragend', reset);
+    return () => {
+      window.removeEventListener('dragover', prevent);
+      window.removeEventListener('drop', prevent);
+      window.removeEventListener('dragend', reset);
+    };
+  }, []);
+
+  // 键盘：翻页 + 目录/沉浸/全屏 + 旋转 + 快捷键面板
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
       if (e.key === 'Escape') {
@@ -239,6 +401,8 @@ export default function App() {
       }
       // 搜索框等输入场景不拦截按键
       if (isTypingTarget(e.target)) return;
+      // 带 Ctrl / Alt / Meta 的组合键交还给浏览器（如 Ctrl+F 查找）
+      if (e.ctrlKey || e.altKey || e.metaKey) return;
       if (e.key === '?') {
         e.preventDefault();
         setHintsOpen((v) => !v);
@@ -247,15 +411,30 @@ export default function App() {
       // 快捷键面板打开时，除 Esc / ? 外不响应其它按键
       if (hintsOpenRef.current) return;
 
-      if (e.key.toLowerCase() === (hideKeyRef.current || 'f').toLowerCase()) {
+      const key = e.key.toLowerCase();
+      if (key === shortcutsRef.current.immersive) {
         // 沉浸模式：隐藏状态栏时一并隐藏目录，显示时一并恢复
         const next = !barsVisibleRef.current;
         setBarsVisible(next);
         setDirVisible(next);
         return;
       }
-      if (e.key.toLowerCase() === 'd') {
+      if (key === shortcutsRef.current.dir) {
         setDirVisible((v) => !v);
+        return;
+      }
+      if (key === shortcutsRef.current.fullscreen) {
+        e.preventDefault();
+        toggleFullscreen();
+        return;
+      }
+      // 旋转为固定键位：Q 逆时针 / E 顺时针
+      if (key === 'q') {
+        rotateBy(-90);
+        return;
+      }
+      if (key === 'e') {
+        rotateBy(90);
         return;
       }
       if (mode === 'scroll') return;
@@ -269,7 +448,7 @@ export default function App() {
     }
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [mode, goPrev, goNext]);
+  }, [mode, goPrev, goNext, rotateBy, toggleFullscreen]);
 
   // 滚轮：Ctrl+滚轮缩放（以鼠标为中心），普通滚轮翻页；原生监听支持 preventDefault
   useEffect(() => {
@@ -385,25 +564,22 @@ export default function App() {
     };
   }, [mode, status, images]);
 
-  // 记忆阅读位置：同一文件夹下次打开恢复到上次所在图片（防抖写入 + 卸载时刷新）
+  // 记忆文件夹阅读状态（位置 + 模式 + 缩放）：防抖写入，切换文件夹/卸载前补写
   useEffect(() => {
     if (!dirName || status !== 'ready') return;
-    pendingPosRef.current = { dir: dirName, index: currentIndex };
-    const id = window.setTimeout(() => {
-      const p = pendingPosRef.current;
-      if (p) void savePosition(p.dir, p.index);
-    }, 400);
+    pendingStateRef.current = { dir: dirName, state: { index: currentIndex, mode, zoom: view.s } };
+    const id = window.setTimeout(() => flushPendingState(), 400);
     return () => window.clearTimeout(id);
-  }, [currentIndex, dirName, status]);
+  }, [currentIndex, mode, view.s, dirName, status, flushPendingState]);
 
-  // 卸载前把尚未落盘的缩放/位置补写一次，避免丢失最后一次变化
+  // 卸载前把尚未落盘的缩放/文件夹状态补写一次，并回收缩略图缓存
   useEffect(
     () => () => {
-      const p = pendingPosRef.current;
-      if (p) void savePosition(p.dir, p.index);
+      flushPendingState();
       if (pendingZoomRef.current !== null) void saveLastZoom(pendingZoomRef.current);
+      clearThumbs();
     },
-    [],
+    [flushPendingState],
   );
 
   // 目录栏虚拟滚动：测量可视区域并随滚动/尺寸变化更新窗口
@@ -444,30 +620,58 @@ export default function App() {
     }
   }
 
-  async function loadFromHandle(handle: FileSystemDirectoryHandle) {
+  async function loadFromHandle(handle: FileSystemDirectoryHandle, pre?: ScanResult) {
+    // 切换目录前先把上一个文件夹的阅读状态落盘
+    flushPendingState();
+    const seq = ++loadSeqRef.current;
     setStatus('loading');
     setError('');
     setWarningDismissed(false);
     setDirQuery('');
     try {
-      // 目录扫描与上次阅读位置互不依赖，并行读取
-      const [result, saved] = await Promise.all([
-        scanTopLevelImages(handle),
-        loadPosition(handle.name),
+      // 目录扫描与该文件夹的阅读状态互不依赖，并行读取
+      const [result, state] = await Promise.all([
+        pre ? Promise.resolve(pre) : scanTopLevelImages(handle),
+        loadFolderState(handle.name),
       ]);
+      // 快速连续导入时，旧目录的结果直接丢弃
+      if (loadSeqRef.current !== seq) return;
+      const cfg = configRef.current;
+      const nextMode = state?.mode ?? cfg.defaultMode;
+      const rememberedZoom = lastZoomRef.current;
+      const fallbackZoom =
+        cfg.zoomDefault === 'memory' && rememberedZoom !== undefined ? clampZoom(rememberedZoom) : 1;
+      const nextZoom = state?.zoom !== undefined ? clampZoom(state.zoom) : fallbackZoom;
+      const startIndex =
+        typeof state?.index === 'number' && state.index >= 0 && state.index < result.images.length
+          ? Math.floor(state.index)
+          : 0;
+
+      clearThumbs();
+      setFolderSession((n) => n + 1);
       setImages(result.images);
       setHasSubfolders(result.hasSubfolders);
       setDirName(handle.name);
-      // 恢复该文件夹上次阅读位置（索引有效时）
-      let startIndex = 0;
-      if (typeof saved === 'number' && saved >= 0 && saved < result.images.length) {
-        startIndex = saved;
-      }
+      setMode(nextMode);
+      setView({ s: nextZoom, x: 0, y: 0 });
+      setNaturalSizes({});
+      setRotation(0);
       setCurrentIndex(startIndex);
       setStatus('ready');
-      if (startIndex > 0) {
-        // 图片为懒加载，先滚动一次后等其高度确定再校正一次，避免落点偏移
-        window.setTimeout(() => scrollToImage(startIndex, 'auto'), 120);
+
+      if (nextMode === 'scroll') {
+        if (startIndex > 0) {
+          // 图片为懒加载，先滚动一次后等其高度确定再校正一次，避免落点偏移
+          window.setTimeout(() => {
+            if (loadSeqRef.current === seq) scrollToImage(startIndex, 'auto');
+          }, 120);
+        }
+      } else if (nextZoom !== 1) {
+        // 单/双页恢复缩放后，在布局稳定后按舞台中心重新居中
+        window.setTimeout(() => {
+          if (loadSeqRef.current !== seq) return;
+          setView({ s: nextZoom, ...centeredOffset(stageRef.current, nextZoom) });
+        }, 60);
       }
     } catch (e) {
       setStatus('error');
@@ -498,8 +702,58 @@ export default function App() {
     }
   }
 
+  function onDragEnter(e: React.DragEvent) {
+    if (!e.dataTransfer.types.includes('Files')) return;
+    e.preventDefault();
+    dragDepthRef.current += 1;
+    setDragActive(true);
+  }
+
+  function onDragOver(e: React.DragEvent) {
+    if (!e.dataTransfer.types.includes('Files')) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  }
+
+  function onDragLeave() {
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) setDragActive(false);
+  }
+
+  async function onDrop(e: React.DragEvent) {
+    if (!e.dataTransfer.types.includes('Files')) return;
+    e.preventDefault();
+    dragDepthRef.current = 0;
+    setDragActive(false);
+
+    if (!supportsDirectoryDrop()) {
+      setError(t(lang, 'dropUnsupported'));
+      return;
+    }
+    const handle = await extractDirectoryHandle(e.dataTransfer.items);
+    if (!handle) {
+      setError(t(lang, 'dropNotFolder'));
+      return;
+    }
+    try {
+      // 先校验目录内是否有图片，避免空目录替换当前阅读状态
+      const result = await scanTopLevelImages(handle);
+      if (result.images.length === 0) {
+        setError(t(lang, 'dropNoImages'));
+        return;
+      }
+      await saveLastDir(handle);
+      setStoredHandle(null);
+      setReauthNeeded(false);
+      await loadFromHandle(handle, result);
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
   function selectMode(next: ReaderMode) {
     setMode(next);
+    setRotation(0);
     setCurrentIndex((i) => Math.min(i, Math.max(images.length - 1, 0)));
     recenter();
   }
@@ -595,16 +849,22 @@ export default function App() {
       // 目标当前在内容中的位置（用于判断是否已稳定）
       const offset = Math.round(stage.scrollTop + delta);
       if (Math.abs(delta) > 1.5) stage.scrollTop += delta;
-      if (Math.abs(delta) <= 1.5 && offset === lastOffset) stable += 1;
+      // 目标图片尚未解码完成时不计入稳定：加载后高度变化会把落点推走
+      const img = el.querySelector<HTMLImageElement>('img.image-item');
+      const loading = !!el.querySelector('.image-item--loading');
+      const failed = !!el.querySelector('.image-item--error');
+      const waiting = loading || (img ? !img.complete : !failed);
+      if (!waiting && Math.abs(delta) <= 1.5 && offset === lastOffset) stable += 1;
       else stable = 0;
       lastOffset = offset;
       if (stable >= 2 || Date.now() > deadline) return;
-      window.setTimeout(step, 60);
+      window.setTimeout(step, waiting ? 80 : 60);
     };
     window.setTimeout(step, 60);
   }
 
   function jumpTo(index: number) {
+    setRotation(0);
     setCurrentIndex(index);
     if (mode === 'scroll') {
       scrollToImage(index);
@@ -664,6 +924,28 @@ export default function App() {
     0,
   );
 
+  // 旋转尺寸适配：单页 / 滚动用当前图片，双页按半宽分别计算
+  const currentName = images[currentIndex]?.name ?? '';
+  const currentNatural = currentName ? naturalSizes[currentName] : undefined;
+  const singleFit =
+    rotation && currentNatural
+      ? fitRotatedSize(currentNatural, stageSize.w, stageSize.h, rotation)
+      : null;
+  const scrollFit =
+    rotation && currentNatural ? fitRotatedSize(currentNatural, stageSize.w, null, rotation) : null;
+  const scrollBox = scrollFit ? rotatedBox(scrollFit, rotation) : null;
+  const doubleBoxW = Math.max(0, (stageSize.w - 16) / 2);
+  const doublePages =
+    mode === 'double'
+      ? doubleIndices(currentSpread, images.length).map((i) => {
+          const name = images[i]?.name ?? '';
+          const natural = name ? naturalSizes[name] : undefined;
+          const fit =
+            rotation && natural ? fitRotatedSize(natural, doubleBoxW, stageSize.h, rotation) : null;
+          return { index: i, name, fit };
+        })
+      : [];
+
   // 目录栏：当前项保持在可视区域内（虚拟滚动下按行高计算并滚动容器）
   useEffect(() => {
     const el = listRef.current;
@@ -681,7 +963,13 @@ export default function App() {
   }, [currentIndex, currentSpread, mode, dirQuery, dirVisible, posByIndex]);
 
   return (
-    <div className="reader">
+    <div
+      className="reader"
+      onDragEnter={onDragEnter}
+      onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
+    >
       {barsVisible && (
         <header className="toolbar">
           <div className="toolbar__group toolbar__group--left">
@@ -741,6 +1029,24 @@ export default function App() {
             </button>
             <button
               className="icon-btn"
+              title={t(lang, 'rotateLeft')}
+              aria-label={t(lang, 'rotateLeft')}
+              disabled={images.length === 0}
+              onClick={() => rotateBy(-90)}
+            >
+              <Icon name="rotateLeft" size={17} />
+            </button>
+            <button
+              className="icon-btn"
+              title={t(lang, 'rotateRight')}
+              aria-label={t(lang, 'rotateRight')}
+              disabled={images.length === 0}
+              onClick={() => rotateBy(90)}
+            >
+              <Icon name="rotateRight" size={17} />
+            </button>
+            <button
+              className="icon-btn"
               title={`${t(lang, 'themeToggle')} · ${t(lang, config.theme === 'dark' ? 'themeLight' : 'themeDark')}`}
               aria-label={t(lang, 'themeToggle')}
               onClick={toggleTheme}
@@ -757,7 +1063,7 @@ export default function App() {
             </button>
             <button
               className="icon-btn"
-              title={`${t(lang, 'hide')} (${hideKey})`}
+              title={`${t(lang, 'hide')} (${immersiveKey})`}
               aria-label={t(lang, 'hide')}
               onClick={() => {
                 setBarsVisible(false);
@@ -812,13 +1118,17 @@ export default function App() {
             {dirSlice.map(({ img, index }) => {
               const active = activeIndices.has(index);
               return (
-                <li key={img.name}>
+                <li key={`${folderSession}:${img.name}`}>
                   <button
                     className={`dirlist__item${active ? ' dirlist__item--active' : ''}`}
                     title={img.name}
                     onClick={() => jumpTo(index)}
                   >
                     <span className="dirlist__no">{String(index + 1).padStart(2, '0')}</span>
+                    <Thumbnail
+                      cacheKey={thumbKey(dirName, img.name)}
+                      fileHandle={img.fileHandle}
+                    />
                     <span className="dirlist__name">{img.name}</span>
                   </button>
                 </li>
@@ -898,7 +1208,17 @@ export default function App() {
           )}
 
           {status === 'ready' && mode === 'scroll' && (
-            <ScrollList images={images} zoom={view.s} />
+            <ScrollList
+              images={images}
+              zoom={view.s}
+              rotation={rotation}
+              rotateIndex={rotation ? currentIndex : -1}
+              rotateW={scrollFit?.w ?? 0}
+              rotateH={scrollFit?.h ?? 0}
+              rotateBoxW={scrollBox?.w ?? 0}
+              rotateBoxH={scrollBox?.h ?? 0}
+              onSize={onImageSize}
+            />
           )}
 
           {status === 'ready' && mode === 'single' && (
@@ -912,10 +1232,36 @@ export default function App() {
               onMouseDown={onZoomableMouseDown}
             >
               {images[currentIndex] && (
-                <ImageItem
-                  fileHandle={images[currentIndex].fileHandle}
-                  alt={images[currentIndex].name}
-                />
+                <div
+                  className={`rotator${singleFit ? ' rotator--active' : ''}`}
+                  style={
+                    singleFit
+                      ? {
+                          width: rotatedBox(singleFit, rotation).w,
+                          height: rotatedBox(singleFit, rotation).h,
+                        }
+                      : undefined
+                  }
+                >
+                  <div
+                    className="rotator__inner"
+                    style={
+                      singleFit
+                        ? {
+                            width: singleFit.w,
+                            height: singleFit.h,
+                            transform: `rotate(${rotation}deg)`,
+                          }
+                        : undefined
+                    }
+                  >
+                    <ImageItem
+                      fileHandle={images[currentIndex].fileHandle}
+                      alt={images[currentIndex].name}
+                      onSize={onImageSize}
+                    />
+                  </div>
+                </div>
               )}
             </div>
           )}
@@ -930,13 +1276,39 @@ export default function App() {
               }}
               onMouseDown={onZoomableMouseDown}
             >
-              {doubleIndices(currentSpread, images.length).map((i) => (
-                <div key={images[i]?.name} className="double__page">
-                  {images[i] && (
-                    <ImageItem fileHandle={images[i].fileHandle} alt={images[i].name} />
-                  )}
-                </div>
-              ))}
+              {doublePages.map(({ index, name, fit }) => {
+                const img = images[index];
+                const box = fit ? rotatedBox(fit, rotation) : null;
+                return (
+                  <div key={`${index}-${name}`} className="double__page">
+                    {img && (
+                      <div
+                        className={`rotator${box ? ' rotator--active' : ''}`}
+                        style={box ? { width: box.w, height: box.h } : undefined}
+                      >
+                        <div
+                          className="rotator__inner"
+                          style={
+                            fit
+                              ? {
+                                  width: fit.w,
+                                  height: fit.h,
+                                  transform: `rotate(${rotation}deg)`,
+                                }
+                              : undefined
+                          }
+                        >
+                          <ImageItem
+                            fileHandle={img.fileHandle}
+                            alt={img.name}
+                            onSize={onImageSize}
+                          />
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           )}
 
@@ -972,6 +1344,15 @@ export default function App() {
           )}
         </main>
       </div>
+
+      {dragActive && (
+        <div className="dropzone" aria-hidden="true">
+          <div className="dropzone__inner">
+            <Icon name="folderPlus" size={26} />
+            <span>{t(lang, 'dropHint')}</span>
+          </div>
+        </div>
+      )}
 
       {barsVisible && (
         <footer className="statusbar">
@@ -1094,15 +1475,28 @@ export default function App() {
                 </span>
               </li>
               <li className="sheet__row">
+                <span>{t(lang, 'scRotate')}</span>
+                <span className="sheet__keys">
+                  <kbd>Q</kbd>
+                  <kbd>E</kbd>
+                </span>
+              </li>
+              <li className="sheet__row">
                 <span>{t(lang, 'scDir')}</span>
                 <span className="sheet__keys">
-                  <kbd>D</kbd>
+                  <kbd>{shortcuts.dir.toUpperCase()}</kbd>
                 </span>
               </li>
               <li className="sheet__row">
                 <span>{t(lang, 'scImmersive')}</span>
                 <span className="sheet__keys">
-                  <kbd>{hideKey}</kbd>
+                  <kbd>{immersiveKey}</kbd>
+                </span>
+              </li>
+              <li className="sheet__row">
+                <span>{t(lang, 'scFullscreen')}</span>
+                <span className="sheet__keys">
+                  <kbd>{shortcuts.fullscreen.toUpperCase()}</kbd>
                 </span>
               </li>
               <li className="sheet__row">

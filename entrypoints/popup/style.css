@@ -19,6 +19,7 @@
   --border: #e3e8e6;
   --border-strong: #d2d9d6;
   --hover: #eef2f0;
+  --err-text: #b42318;
   --shadow-sm: 0 1px 2px rgba(16, 24, 32, 0.06);
 }
 
@@ -38,6 +39,7 @@
   --border: #293033;
   --border-strong: #364044;
   --hover: #242b2e;
+  --err-text: #f6a6a0;
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
 }
 
@@ -49,6 +51,7 @@ html,
 body {
   margin: 0;
   width: 332px;
+  max-height: 600px;
 }
 
 body {
@@ -57,6 +60,8 @@ body {
 
 .popup {
   width: 332px;
+  max-height: 600px;
+  overflow-y: auto;
   padding: 14px 14px 12px;
   background: var(--panel);
   color: var(--text);
@@ -216,6 +221,55 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+/* 可折叠分组标题（快捷键设置） */
+.group__toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  margin-top: 8px;
+  padding: 4px 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.group__toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.group__chev {
+  flex-shrink: 0;
+  color: var(--text-soft);
+  transition: transform 0.16s ease;
+}
+
+.group__chev--open {
+  transform: rotate(180deg);
+}
+
+.shortcut-list {
+  margin-top: 4px;
+}
+
+.shortcut-reset {
+  margin-top: 6px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent-strong);
+  font-family: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
 /* ---------------------------------------------------------------- 表单行 */
 
 .row {
@@ -238,6 +292,10 @@ body {
   font-size: 11px;
   line-height: 1.5;
   color: var(--text-soft);
+}
+
+.row__hint--warn {
+  color: var(--err-text);
 }
 
 /* 下拉 */

@@ -19,6 +19,8 @@ export type IconName =
   | 'modeDouble'
   | 'sidebar'
   | 'reset'
+  | 'rotateLeft'
+  | 'rotateRight'
   | 'arrowRight'
   | 'alert'
   | 'image';
@@ -86,6 +88,18 @@ const content: Record<IconName, ReactNode> = {
     </>
   ),
   reset: <path d="M3.6 12a8.4 8.4 0 1 0 2.6-6.1M3.6 4.2v5h5" />,
+  rotateLeft: (
+    <>
+      <path d="M3 4.5v5.5h5.5" />
+      <path d="M3.9 14.9A8.5 8.5 0 1 0 5.7 6.7L3 9.4" />
+    </>
+  ),
+  rotateRight: (
+    <>
+      <path d="M21 4.5v5.5h-5.5" />
+      <path d="M20.1 14.9A8.5 8.5 0 1 1 18.3 6.7L21 9.4" />
+    </>
+  ),
   arrowRight: <path d="M4.6 12h14.8M13.6 6l6 6-6 6" />,
   alert: (
     <>
