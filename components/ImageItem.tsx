@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 
 interface ImageItemProps {
   fileHandle: FileSystemFileHandle;
@@ -8,8 +8,9 @@ interface ImageItemProps {
 }
 
 /** 渲染单张图片：按需读取文件并创建 object URL，卸载时回收；支持视口懒加载 */
-export default function ImageItem({ fileHandle, alt, lazy = false }: ImageItemProps) {
+function ImageItem({ fileHandle, alt, lazy = false }: ImageItemProps) {
   const [url, setUrl] = useState('');
+  const [failed, setFailed] = useState(false);
   const hostRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -17,11 +18,17 @@ export default function ImageItem({ fileHandle, alt, lazy = false }: ImageItemPr
     let active = true;
 
     const load = () => {
-      fileHandle.getFile().then((file) => {
-        if (!active) return;
-        objectUrl = URL.createObjectURL(file);
-        setUrl(objectUrl);
-      });
+      fileHandle
+        .getFile()
+        .then((file) => {
+          if (!active) return;
+          objectUrl = URL.createObjectURL(file);
+          setUrl(objectUrl);
+        })
+        .catch(() => {
+          // 文件被移动/删除或权限失效时降级为错误占位，避免 unhandled rejection
+          if (active) setFailed(true);
+        });
     };
 
     let observer: IntersectionObserver | undefined;
@@ -51,9 +58,15 @@ export default function ImageItem({ fileHandle, alt, lazy = false }: ImageItemPr
     };
   }, [fileHandle, lazy]);
 
+  if (failed) {
+    return <div className="image-item--error" role="img" aria-label={alt} title={alt} />;
+  }
+
   if (!url) {
     return <div ref={hostRef} className="image-item--loading" role="img" aria-label={alt} />;
   }
 
   return <img className="image-item" src={url} alt={alt} draggable={false} />;
 }
+
+export default memo(ImageItem);

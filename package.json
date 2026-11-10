@@ -2,7 +2,7 @@
   "name": "fishtwo",
   "description": "摸鱼二号（FishTwo）— Edge 图片阅读插件",
   "private": true,
-  "version": "1.0.0",
+  "version": "0.1.2",
   "type": "module",
   "scripts": {
     "dev": "wxt",

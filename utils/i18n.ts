@@ -75,6 +75,7 @@ const dict: Record<Lang, Record<string, string>> = {
     resetZoom: '恢复 100%',
     dismiss: '知道了',
     progress: '阅读进度',
+    readingMode: '阅读模式',
   },
   en: {
     name: 'FishTwo',
@@ -145,6 +146,7 @@ const dict: Record<Lang, Record<string, string>> = {
     resetZoom: 'Reset to 100%',
     dismiss: 'Got it',
     progress: 'Reading progress',
+    readingMode: 'Reading mode',
   },
 };
 

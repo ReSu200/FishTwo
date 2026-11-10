@@ -3,6 +3,7 @@ import { scanTopLevelImages, type ImageEntry } from '@/utils/files';
 import { saveLastDir, loadLastDir } from '@/utils/db';
 import { doubleSpreadCount, spreadOfIndex, doubleIndices } from '@/utils/paging';
 import ImageItem from '@/components/ImageItem';
+import ScrollList from '@/components/ScrollList';
 import Icon, { type IconName } from '@/components/Icon';
 import Logo from '@/components/Logo';
 import {
@@ -29,6 +30,27 @@ const MODES: { key: ReaderMode; labelKey: string; icon: IconName }[] = [
 const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 5;
 const clampZoom = (v: number) => Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, v));
+
+// 目录栏虚拟滚动参数（与 CSS .dirlist__item 的 height 保持一致）
+const DIR_ROW_H = 34;
+const DIR_OVERSCAN = 6;
+
+/** 空状态插画：静态内容，提到模块级避免每次渲染重建 */
+const EMPTY_ART = (
+  <svg className="empty__art" viewBox="0 0 160 120" aria-hidden="true">
+    <rect x="18" y="26" width="94" height="70" rx="10" fill="currentColor" opacity=".07" />
+    <rect x="30" y="16" width="94" height="70" rx="10" fill="currentColor" opacity=".1" />
+    <rect x="44" y="8" width="94" height="70" rx="10" fill="currentColor" opacity=".14" />
+    <path
+      d="M70 40c4.2 5.6 9.3 8.4 15.2 8.4 5.1 0 9.2-3.7 9.2-8.4s-4.1-8.4-9.2-8.4c-5.9 0-11 2.8-15.2 8.4z"
+      fill="var(--accent)"
+      opacity=".55"
+    />
+    <path d="M70.6 40 64 34v12z" fill="var(--accent)" opacity=".55" />
+    <circle cx="89" cy="38" r="1.6" fill="var(--panel)" />
+    <path d="M56 62h50M56 70h34" stroke="currentColor" strokeWidth="3" strokeLinecap="round" opacity=".16" />
+  </svg>
+);
 
 interface View {
   s: number;
@@ -87,17 +109,40 @@ export default function App() {
   const [reauthNeeded, setReauthNeeded] = useState(false);
 
   const stageRef = useRef<HTMLElement | null>(null);
-  const scrollRef = useRef<HTMLDivElement | null>(null);
   const lastFlipRef = useRef(0);
   const clickTimerRef = useRef<number | undefined>(undefined);
   const dragRef = useRef<{ startX: number; startY: number; originX: number; originY: number } | null>(null);
-  const activeItemRef = useRef<HTMLButtonElement | null>(null);
+  // 目录栏虚拟滚动
+  const listRef = useRef<HTMLUListElement | null>(null);
+  const [listView, setListView] = useState({ top: 0, height: 0 });
+  // 最新值引用：让事件订阅（键盘等）不因这些值变化而反复重订阅
+  const viewRef = useRef(view);
+  const barsVisibleRef = useRef(barsVisible);
+  const hintsOpenRef = useRef(hintsOpen);
+  const hideKeyRef = useRef(config.hideKey);
   // 目录跳转的校正序号：用户主动滚动/按键时递增，使未执行的校正失效
   const jumpSeqRef = useRef(0);
+  // 存储写入防抖：滚动/缩放会高频变化，攒一段时间再写，避免每次变化都写 storage
+  const pendingPosRef = useRef<{ dir: string; index: number } | null>(null);
+  const pendingZoomRef = useRef<number | null>(null);
 
   const spreadCount = doubleSpreadCount(images.length);
   const currentSpread = spreadOfIndex(currentIndex);
   const hideKey = (config.hideKey || 'f').toUpperCase();
+
+  // 把最新的 view / 状态栏可见性 / 快捷键同步到 ref，供事件处理器读取
+  useEffect(() => {
+    viewRef.current = view;
+    barsVisibleRef.current = barsVisible;
+    hintsOpenRef.current = hintsOpen;
+    hideKeyRef.current = config.hideKey;
+  });
+
+  /** 按当前缩放重新居中（在事件处理器中计算，保持 setView 为纯更新） */
+  const recenter = useCallback(() => {
+    const s = viewRef.current.s;
+    setView({ s, ...centeredOffset(stageRef.current, s) });
+  }, []);
 
   const goPrev = useCallback(() => {
     if (mode === 'single') {
@@ -108,8 +153,8 @@ export default function App() {
         return doubleIndices(prevSpread, images.length)[0] ?? 0;
       });
     }
-    setView((v) => ({ s: v.s, ...centeredOffset(stageRef.current, v.s) }));
-  }, [mode, images.length]);
+    recenter();
+  }, [mode, images.length, recenter]);
 
   const goNext = useCallback(() => {
     if (mode === 'single') {
@@ -120,8 +165,8 @@ export default function App() {
         return doubleIndices(nextSpread, images.length)[0] ?? i;
       });
     }
-    setView((v) => ({ s: v.s, ...centeredOffset(stageRef.current, v.s) }));
-  }, [mode, images.length]);
+    recenter();
+  }, [mode, images.length, recenter]);
 
   // 初始化配置 + 自动恢复最近文件夹
   useEffect(() => {
@@ -129,23 +174,30 @@ export default function App() {
   }, []);
 
   async function init() {
-    const cfg = await loadConfig();
+    // 配置、缩放记忆、最近目录彼此独立，并行读取减少启动串行等待
+    const [cfg, z, handle] = await Promise.all([
+      loadConfig(),
+      loadLastZoom(),
+      loadLastDir(),
+    ]);
     document.documentElement.dataset.theme = cfg.theme;
     setConfig(cfg);
     setLang(resolveLang(cfg.lang));
     setMode(cfg.defaultMode);
-    if (cfg.zoomDefault === 'memory') {
-      const z = await loadLastZoom();
-      if (z !== undefined) setView((v) => ({ ...v, s: clampZoom(z) }));
+    if (cfg.zoomDefault === 'memory' && z !== undefined) {
+      setView((v) => ({ ...v, s: clampZoom(z) }));
     }
-    await restoreLastDir();
+    if (handle) await restoreDir(handle);
   }
 
-  // 记忆上次缩放
+  // 记忆上次缩放（防抖写入：连续 Ctrl+滚轮只写最后一次）
   useEffect(() => {
-    if (config.zoomDefault === 'memory') {
-      void saveLastZoom(view.s);
-    }
+    if (config.zoomDefault !== 'memory') return;
+    pendingZoomRef.current = view.s;
+    const id = window.setTimeout(() => {
+      if (pendingZoomRef.current !== null) void saveLastZoom(pendingZoomRef.current);
+    }, 400);
+    return () => window.clearTimeout(id);
   }, [view.s, config.zoomDefault]);
 
   // 配置实时同步（主题/语言/快捷键等）
@@ -179,7 +231,7 @@ export default function App() {
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
       if (e.key === 'Escape') {
-        if (hintsOpen) {
+        if (hintsOpenRef.current) {
           e.preventDefault();
           setHintsOpen(false);
         }
@@ -193,11 +245,11 @@ export default function App() {
         return;
       }
       // 快捷键面板打开时，除 Esc / ? 外不响应其它按键
-      if (hintsOpen) return;
+      if (hintsOpenRef.current) return;
 
-      if (e.key.toLowerCase() === (config.hideKey || 'f').toLowerCase()) {
+      if (e.key.toLowerCase() === (hideKeyRef.current || 'f').toLowerCase()) {
         // 沉浸模式：隐藏状态栏时一并隐藏目录，显示时一并恢复
-        const next = !barsVisible;
+        const next = !barsVisibleRef.current;
         setBarsVisible(next);
         setDirVisible(next);
         return;
@@ -217,7 +269,7 @@ export default function App() {
     }
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [config.hideKey, mode, goPrev, goNext, barsVisible, hintsOpen]);
+  }, [mode, goPrev, goNext]);
 
   // 滚轮：Ctrl+滚轮缩放（以鼠标为中心），普通滚轮翻页；原生监听支持 preventDefault
   useEffect(() => {
@@ -277,7 +329,7 @@ export default function App() {
     };
   }, []);
 
-  // 下拉滚动模式：随滚动更新当前图片索引，实现目录高亮与阅读进度双向同步。
+  // 下拉滚动模式：一次滚动同时更新「当前图片索引」与「阅读进度」。
   // 说明：不用 IntersectionObserver（其回调只包含「变化」的条目，图片懒加载改变高度时
   // 会漏掉真正的顶部图片），改为按元素位置二分查找当前视口顶部的图片。
   useEffect(() => {
@@ -289,24 +341,28 @@ export default function App() {
     const compute = () => {
       raf = 0;
       const items = root.querySelectorAll<HTMLElement>('.scroll__item');
-      if (items.length === 0) return;
-      const rootTop = root.getBoundingClientRect().top + (parseFloat(getComputedStyle(root).paddingTop) || 0);
-      let lo = 0;
-      let hi = items.length - 1;
-      let best = 0;
-      while (lo <= hi) {
-        const mid = (lo + hi) >> 1;
-        const item = items[mid];
-        if (!item) break;
-        const top = item.getBoundingClientRect().top;
-        if (top <= rootTop + 4) {
-          best = mid;
-          lo = mid + 1;
-        } else {
-          hi = mid - 1;
+      if (items.length > 0) {
+        const rootTop = root.getBoundingClientRect().top + (parseFloat(getComputedStyle(root).paddingTop) || 0);
+        let lo = 0;
+        let hi = items.length - 1;
+        let best = 0;
+        while (lo <= hi) {
+          const mid = (lo + hi) >> 1;
+          const item = items[mid];
+          if (!item) break;
+          const top = item.getBoundingClientRect().top;
+          if (top <= rootTop + 4) {
+            best = mid;
+            lo = mid + 1;
+          } else {
+            hi = mid - 1;
+          }
         }
+        setCurrentIndex(best);
       }
-      setCurrentIndex(best);
+      const max = root.scrollHeight - root.clientHeight;
+      const p = max > 0 ? Math.round((root.scrollTop / max) * 100) : 100;
+      setScrollProgress(Math.max(0, Math.min(100, p)));
     };
 
     const schedule = () => {
@@ -329,36 +385,56 @@ export default function App() {
     };
   }, [mode, status, images]);
 
-  // 记忆阅读位置：同一文件夹下次打开恢复到上次所在图片（按文件夹分别存储）
+  // 记忆阅读位置：同一文件夹下次打开恢复到上次所在图片（防抖写入 + 卸载时刷新）
   useEffect(() => {
-    if (dirName && status === 'ready') {
-      void savePosition(dirName, currentIndex);
-    }
+    if (!dirName || status !== 'ready') return;
+    pendingPosRef.current = { dir: dirName, index: currentIndex };
+    const id = window.setTimeout(() => {
+      const p = pendingPosRef.current;
+      if (p) void savePosition(p.dir, p.index);
+    }, 400);
+    return () => window.clearTimeout(id);
   }, [currentIndex, dirName, status]);
 
-  // 下拉滚动模式：计算阅读进度百分比
+  // 卸载前把尚未落盘的缩放/位置补写一次，避免丢失最后一次变化
+  useEffect(
+    () => () => {
+      const p = pendingPosRef.current;
+      if (p) void savePosition(p.dir, p.index);
+      if (pendingZoomRef.current !== null) void saveLastZoom(pendingZoomRef.current);
+    },
+    [],
+  );
+
+  // 目录栏虚拟滚动：测量可视区域并随滚动/尺寸变化更新窗口
   useEffect(() => {
-    if (mode !== 'scroll' || status !== 'ready') return;
-    const el = stageRef.current;
+    const el = listRef.current;
     if (!el) return;
-    const onScroll = () => {
-      const max = el.scrollHeight - el.clientHeight;
-      const p = max > 0 ? Math.round((el.scrollTop / max) * 100) : 100;
-      setScrollProgress(Math.max(0, Math.min(100, p)));
+    let raf = 0;
+    // 用 rAF 延后到布局稳定后再测量，避免读到未约束的高度导致一次性渲染全部条目
+    const measure = () => {
+      raf = 0;
+      const height = el.clientHeight;
+      const top = el.scrollTop;
+      setListView((prev) => (prev.height === height && prev.top === top ? prev : { top, height }));
     };
-    el.addEventListener('scroll', onScroll, { passive: true });
-    onScroll();
-    return () => el.removeEventListener('scroll', onScroll);
-  }, [mode, status, images]);
+    const schedule = () => {
+      if (!raf) raf = requestAnimationFrame(measure);
+    };
+    schedule();
+    el.addEventListener('scroll', schedule, { passive: true });
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(schedule) : null;
+    ro?.observe(el);
+    window.addEventListener('resize', schedule);
+    return () => {
+      el.removeEventListener('scroll', schedule);
+      ro?.disconnect();
+      window.removeEventListener('resize', schedule);
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [status, images, dirVisible]);
 
-  // 目录栏：当前项保持在可视区域内
-  useEffect(() => {
-    activeItemRef.current?.scrollIntoView({ block: 'nearest' });
-  }, [currentIndex, dirQuery, dirVisible]);
-
-  async function restoreLastDir() {
-    const handle = await loadLastDir();
-    if (!handle) return;
+  async function restoreDir(handle: FileSystemDirectoryHandle) {
     const perm = await handle.queryPermission({ mode: 'read' });
     if (perm === 'granted') {
       await loadFromHandle(handle);
@@ -374,13 +450,16 @@ export default function App() {
     setWarningDismissed(false);
     setDirQuery('');
     try {
-      const result = await scanTopLevelImages(handle);
+      // 目录扫描与上次阅读位置互不依赖，并行读取
+      const [result, saved] = await Promise.all([
+        scanTopLevelImages(handle),
+        loadPosition(handle.name),
+      ]);
       setImages(result.images);
       setHasSubfolders(result.hasSubfolders);
       setDirName(handle.name);
       // 恢复该文件夹上次阅读位置（索引有效时）
       let startIndex = 0;
-      const saved = await loadPosition(handle.name);
       if (typeof saved === 'number' && saved >= 0 && saved < result.images.length) {
         startIndex = saved;
       }
@@ -422,7 +501,7 @@ export default function App() {
   function selectMode(next: ReaderMode) {
     setMode(next);
     setCurrentIndex((i) => Math.min(i, Math.max(images.length - 1, 0)));
-    setView((v) => ({ s: v.s, ...centeredOffset(stageRef.current, v.s) }));
+    recenter();
   }
 
   function resetZoom() {
@@ -489,14 +568,40 @@ export default function App() {
     e.preventDefault();
   }
 
-  /** 滚动定位到指定图片：图片懒加载会改变高度，故分多次校正落点（用户滚动/按键会取消） */
+  /**
+   * 滚动定位到指定图片。
+   * 说明：图片懒加载会把占位块（约 220px）换成真实高度，跳转途中上方内容持续变高会把目标推走，
+   * 固定次数的定时校正无法收敛（大目录下会明显偏前），故改为「校正到目标位置稳定」的收敛式滚动。
+   * 用户滚轮操作会递增 jumpSeq 从而中断校正。
+   */
   function scrollToImage(index: number, behavior: ScrollBehavior = 'smooth') {
     const seq = ++jumpSeqRef.current;
-    const scroll = () => {
+    document.getElementById(`img-${index}`)?.scrollIntoView({ behavior, block: 'start' });
+
+    const stage = stageRef.current;
+    if (!stage) return;
+    // 样式只读一次，避免在 60ms × 最长 3s 的校正循环里反复触发样式计算
+    const paddingTop = parseFloat(getComputedStyle(stage).paddingTop) || 0;
+    const deadline = Date.now() + 3000;
+    let lastOffset = Number.NaN;
+    let stable = 0;
+
+    const step = () => {
       if (jumpSeqRef.current !== seq) return;
-      document.getElementById(`img-${index}`)?.scrollIntoView({ behavior, block: 'start' });
+      const el = document.getElementById(`img-${index}`);
+      if (!el) return;
+      const contentTop = stage.getBoundingClientRect().top + paddingTop;
+      const delta = el.getBoundingClientRect().top - contentTop;
+      // 目标当前在内容中的位置（用于判断是否已稳定）
+      const offset = Math.round(stage.scrollTop + delta);
+      if (Math.abs(delta) > 1.5) stage.scrollTop += delta;
+      if (Math.abs(delta) <= 1.5 && offset === lastOffset) stable += 1;
+      else stable = 0;
+      lastOffset = offset;
+      if (stable >= 2 || Date.now() > deadline) return;
+      window.setTimeout(step, 60);
     };
-    [0, 350, 800, 1300].forEach((delay) => window.setTimeout(scroll, delay));
+    window.setTimeout(step, 60);
   }
 
   function jumpTo(index: number) {
@@ -506,12 +611,28 @@ export default function App() {
     }
   }
 
-  const filtered = useMemo(() => {
+  // 目录过滤：同时产出「图片索引 → 过滤后位置」映射，避免每次滚动做 O(n) 查找
+  const { filtered, posByIndex } = useMemo(() => {
     const q = dirQuery.trim().toLowerCase();
-    return images
-      .map((img, index) => ({ img, index }))
-      .filter(({ img }) => !q || img.name.toLowerCase().includes(q));
+    const list: { img: ImageEntry; index: number }[] = [];
+    const pos = new Map<number, number>();
+    images.forEach((img, index) => {
+      if (!q || img.name.toLowerCase().includes(q)) {
+        pos.set(index, list.length);
+        list.push({ img, index });
+      }
+    });
+    return { filtered: list, posByIndex: pos };
   }, [images, dirQuery]);
+
+  // 目录栏虚拟滚动窗口：仅渲染可视区域附近的条目
+  const dirTotal = filtered.length;
+  const dirStart = Math.max(0, Math.floor(listView.top / DIR_ROW_H) - DIR_OVERSCAN);
+  const dirEnd = Math.min(
+    dirTotal,
+    dirStart + Math.ceil((listView.height || 400) / DIR_ROW_H) + DIR_OVERSCAN * 2,
+  );
+  const dirSlice = filtered.slice(dirStart, dirEnd);
 
   const currentNames = (() => {
     if (mode === 'single') return [images[currentIndex]?.name ?? ''];
@@ -542,6 +663,22 @@ export default function App() {
     MODES.findIndex((m) => m.key === mode),
     0,
   );
+
+  // 目录栏：当前项保持在可视区域内（虚拟滚动下按行高计算并滚动容器）
+  useEffect(() => {
+    const el = listRef.current;
+    if (!el || !dirVisible) return;
+    let pos = -1;
+    for (const idx of activeIndices) {
+      const p = posByIndex.get(idx);
+      if (p !== undefined && (pos < 0 || p < pos)) pos = p;
+    }
+    if (pos < 0) return;
+    const top = pos * DIR_ROW_H;
+    const bottom = top + DIR_ROW_H;
+    if (top < el.scrollTop) el.scrollTop = top;
+    else if (bottom > el.scrollTop + el.clientHeight) el.scrollTop = bottom - el.clientHeight;
+  }, [currentIndex, currentSpread, mode, dirQuery, dirVisible, posByIndex]);
 
   return (
     <div className="reader">
@@ -574,7 +711,7 @@ export default function App() {
           </div>
 
           <div className="toolbar__group toolbar__group--center">
-            <div className="segmented" role="group" aria-label="reading mode">
+            <div className="segmented" role="group" aria-label={t(lang, 'readingMode')}>
               <span
                 className="segmented__thumb"
                 style={{ transform: `translateX(${activeModeIndex * 100}%)` }}
@@ -669,13 +806,14 @@ export default function App() {
             <p className="hint">{t(lang, 'searchEmpty')}</p>
           )}
 
-          <ul className="dirlist__items">
-            {filtered.map(({ img, index }) => {
+          <ul className="dirlist__items" ref={listRef}>
+            {/* 虚拟滚动占位：用内部占位元素而非容器 padding —— padding 不可收缩，会撑大滚动容器导致测量震荡 */}
+            <li className="dirlist__spacer" aria-hidden="true" style={{ height: dirStart * DIR_ROW_H }} />
+            {dirSlice.map(({ img, index }) => {
               const active = activeIndices.has(index);
               return (
                 <li key={img.name}>
                   <button
-                    ref={active ? activeItemRef : undefined}
                     className={`dirlist__item${active ? ' dirlist__item--active' : ''}`}
                     title={img.name}
                     onClick={() => jumpTo(index)}
@@ -686,6 +824,7 @@ export default function App() {
                 </li>
               );
             })}
+            <li className="dirlist__spacer" aria-hidden="true" style={{ height: (dirTotal - dirEnd) * DIR_ROW_H }} />
           </ul>
         </aside>
 
@@ -697,19 +836,7 @@ export default function App() {
         >
           {status === 'idle' && (
             <div className="empty">
-              <svg className="empty__art" viewBox="0 0 160 120" aria-hidden="true">
-                <rect x="18" y="26" width="94" height="70" rx="10" fill="currentColor" opacity=".07" />
-                <rect x="30" y="16" width="94" height="70" rx="10" fill="currentColor" opacity=".1" />
-                <rect x="44" y="8" width="94" height="70" rx="10" fill="currentColor" opacity=".14" />
-                <path
-                  d="M70 40c4.2 5.6 9.3 8.4 15.2 8.4 5.1 0 9.2-3.7 9.2-8.4s-4.1-8.4-9.2-8.4c-5.9 0-11 2.8-15.2 8.4z"
-                  fill="var(--accent)"
-                  opacity=".55"
-                />
-                <path d="M70.6 40 64 34v12z" fill="var(--accent)" opacity=".55" />
-                <circle cx="89" cy="38" r="1.6" fill="var(--panel)" />
-                <path d="M56 62h50M56 70h34" stroke="currentColor" strokeWidth="3" strokeLinecap="round" opacity=".16" />
-              </svg>
+              {EMPTY_ART}
               <h2 className="empty__title">{t(lang, 'emptyTitle')}</h2>
               <p className="empty__desc">{t(lang, 'emptyDesc')}</p>
               <div className="empty__actions">
@@ -771,13 +898,7 @@ export default function App() {
           )}
 
           {status === 'ready' && mode === 'scroll' && (
-            <div ref={scrollRef} className="scroll">
-              {images.map((img, index) => (
-                <div key={img.name} id={`img-${index}`} data-index={index} className="scroll__item" style={{ zoom: view.s }}>
-                  <ImageItem fileHandle={img.fileHandle} alt={img.name} lazy />
-                </div>
-              ))}
-            </div>
+            <ScrollList images={images} zoom={view.s} />
           )}
 
           {status === 'ready' && mode === 'single' && (

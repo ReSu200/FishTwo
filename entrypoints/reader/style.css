@@ -451,13 +451,26 @@ body {
   list-style: none;
 }
 
+.dirlist__items > li {
+  display: block;
+  margin: 0;
+}
+
+/* 虚拟滚动占位行：仅撑出滚动高度，不参与布局高度计算 */
+.dirlist__items > .dirlist__spacer {
+  padding: 0;
+  list-style: none;
+}
+
 .dirlist__item {
   position: relative;
   display: flex;
   align-items: center;
   gap: 8px;
   width: 100%;
-  padding: 7px 10px;
+  height: 34px;
+  box-sizing: border-box;
+  padding: 0 10px;
   border: 0;
   border-radius: 7px;
   background: transparent;
@@ -747,6 +760,15 @@ body {
   }
 }
 
+/* 图片读取失败占位（文件被移动/删除或权限失效） */
+.image-item--error {
+  width: min(180px, 42vw);
+  height: min(220px, 34vh);
+  border-radius: 10px;
+  border: 1px dashed var(--border);
+  background: var(--panel-2);
+}
+
 /* 下拉滚动 */
 .scroll {
   display: flex;
@@ -758,6 +780,10 @@ body {
 
 .scroll__item {
   max-width: 100%;
+  /* 长列表跳过离屏项的布局与绘制；contain-intrinsic-size 提供离屏高度估算，
+     实际落点由跳转的收敛式校正兜底 */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 1000px;
 }
 
 .scroll__item .image-item {

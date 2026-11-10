@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   DEFAULT_CONFIG,
   loadConfig,
@@ -66,8 +66,15 @@ export default function App() {
   const lang: Lang = resolveLang(config.lang);
   const hideKey = (config.hideKey || 'f').toUpperCase();
 
+  // 用 ref 持有最新配置：连续修改（如逐字输入快捷键）时不依赖渲染期闭包，避免丢失字段
+  const configRef = useRef(config);
+  useEffect(() => {
+    configRef.current = config;
+  }, [config]);
+
   async function update(patch: Partial<ReaderConfig>) {
-    const next = { ...config, ...patch };
+    const next = { ...configRef.current, ...patch };
+    configRef.current = next;
     setConfig(next);
     await saveConfig(next);
   }
