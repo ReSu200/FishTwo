@@ -7,7 +7,7 @@ export default defineConfig({
     name: '__MSG_extName__',
     description: '__MSG_extDescription__',
     default_locale: 'zh_CN',
-    version: '0.2.0',
+    version: '0.2.1',
     permissions: ['storage'],
     // 图标直接取自 FishOne/icons（public/icons），保持与设计稿一致
     icons: {

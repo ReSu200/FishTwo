@@ -16,6 +16,8 @@ interface ScrollListProps {
   rotateBoxW: number;
   rotateBoxH: number;
   onSize?: (name: string, width: number, height: number) => void;
+  onReadError?: (name: string, error: unknown) => void;
+  errorLabel?: string;
 }
 
 /**
@@ -33,6 +35,8 @@ function ScrollList({
   rotateBoxW,
   rotateBoxH,
   onSize,
+  onReadError,
+  errorLabel,
 }: ScrollListProps) {
   return (
     <div className="scroll">
@@ -50,11 +54,25 @@ function ScrollList({
                     transform: `rotate(${rotation}deg)`,
                   }}
                 >
-                  <ImageItem fileHandle={img.fileHandle} alt={img.name} lazy onSize={onSize} />
+                  <ImageItem
+                    fileHandle={img.fileHandle}
+                    alt={img.name}
+                    lazy
+                    onSize={onSize}
+                    onReadError={onReadError}
+                    errorLabel={errorLabel}
+                  />
                 </div>
               </div>
             ) : (
-              <ImageItem fileHandle={img.fileHandle} alt={img.name} lazy onSize={onSize} />
+              <ImageItem
+                fileHandle={img.fileHandle}
+                alt={img.name}
+                lazy
+                onSize={onSize}
+                onReadError={onReadError}
+                errorLabel={errorLabel}
+              />
             )}
           </div>
         );

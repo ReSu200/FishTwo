@@ -7,10 +7,21 @@ interface ImageItemProps {
   lazy?: boolean;
   /** 图片加载完成后上报自然尺寸（用于旋转后的尺寸适配） */
   onSize?: (name: string, width: number, height: number) => void;
+  /** 文件读取失败时上报（用于判断单文件问题还是整个文件夹失效） */
+  onReadError?: (name: string, error: unknown) => void;
+  /** 读取失败占位的本地化提示 */
+  errorLabel?: string;
 }
 
 /** 渲染单张图片：按需读取文件并创建 object URL，卸载时回收；支持视口懒加载 */
-function ImageItem({ fileHandle, alt, lazy = false, onSize }: ImageItemProps) {
+function ImageItem({
+  fileHandle,
+  alt,
+  lazy = false,
+  onSize,
+  onReadError,
+  errorLabel,
+}: ImageItemProps) {
   const [url, setUrl] = useState('');
   const [failed, setFailed] = useState(false);
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -27,9 +38,11 @@ function ImageItem({ fileHandle, alt, lazy = false, onSize }: ImageItemProps) {
           objectUrl = URL.createObjectURL(file);
           setUrl(objectUrl);
         })
-        .catch(() => {
+        .catch((error) => {
           // 文件被移动/删除或权限失效时降级为错误占位，避免 unhandled rejection
-          if (active) setFailed(true);
+          if (!active) return;
+          setFailed(true);
+          onReadError?.(alt, error);
         });
     };
 
@@ -58,10 +71,11 @@ function ImageItem({ fileHandle, alt, lazy = false, onSize }: ImageItemProps) {
       observer?.disconnect();
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [fileHandle, lazy]);
+  }, [fileHandle, lazy, alt, onReadError]);
 
   if (failed) {
-    return <div className="image-item--error" role="img" aria-label={alt} title={alt} />;
+    const label = errorLabel || alt;
+    return <div className="image-item--error" role="img" aria-label={label} title={label} />;
   }
 
   if (!url) {

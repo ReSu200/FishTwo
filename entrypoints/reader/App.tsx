@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { scanTopLevelImages, type ImageEntry, type ScanResult } from '@/utils/files';
-import { saveLastDir, loadLastDir } from '@/utils/db';
+import { saveLastDir, loadLastDir, removeDirFromHistory } from '@/utils/db';
 import { doubleSpreadCount, spreadOfIndex, doubleIndices } from '@/utils/paging';
 import ImageItem from '@/components/ImageItem';
 import ScrollList from '@/components/ScrollList';
@@ -10,9 +10,11 @@ import Logo from '@/components/Logo';
 import {
   DEFAULT_CONFIG,
   clampZoom,
+  clearFolderInvalid,
   loadConfig,
   loadFolderState,
   loadLastZoom,
+  markFolderInvalid,
   normalizeShortcuts,
   saveConfig,
   saveFolderState,
@@ -22,10 +24,11 @@ import {
   type ReaderMode,
 } from '@/utils/config';
 import { extractDirectoryHandle, supportsDirectoryDrop } from '@/utils/drop';
+import { classifyFolderError, probeDirectory, type FolderErrorKind } from '@/utils/folder-error';
 import { clearThumbs, thumbKey } from '@/utils/thumbs';
 import { resolveLang, t, type Lang } from '@/utils/i18n';
 
-type Status = 'idle' | 'loading' | 'ready' | 'error';
+type Status = 'idle' | 'loading' | 'ready' | 'error' | 'invalid';
 
 const MODES: { key: ReaderMode; labelKey: string; icon: IconName }[] = [
   { key: 'scroll', labelKey: 'modeScroll', icon: 'modeScroll' },
@@ -136,6 +139,7 @@ export default function App() {
   const [warningDismissed, setWarningDismissed] = useState(false);
   const [status, setStatus] = useState<Status>('idle');
   const [error, setError] = useState('');
+  const [folderError, setFolderError] = useState<FolderErrorKind | null>(null);
 
   const [config, setConfig] = useState<ReaderConfig>(DEFAULT_CONFIG);
   const [lang, setLang] = useState<Lang>(resolveLang('system'));
@@ -177,6 +181,10 @@ export default function App() {
   const hintsOpenRef = useRef(hintsOpen);
   const shortcutsRef = useRef(config.shortcuts);
   const configRef = useRef(config);
+  const statusRef = useRef(status);
+  const currentHandleRef = useRef<FileSystemDirectoryHandle | null>(null);
+  const probingRef = useRef(false);
+  const lastProbeRef = useRef(0);
   const lastZoomRef = useRef<number | undefined>(undefined);
   // 目录跳转的校正序号：用户主动滚动/按键时递增，使未执行的校正失效
   const jumpSeqRef = useRef(0);
@@ -200,6 +208,7 @@ export default function App() {
     hintsOpenRef.current = hintsOpen;
     shortcutsRef.current = config.shortcuts;
     configRef.current = config;
+    statusRef.current = status;
   });
 
   /** 按当前缩放重新居中（在事件处理器中计算，保持 setView 为纯更新） */
@@ -225,6 +234,49 @@ export default function App() {
       return { ...prev, [name]: { w, h } };
     });
   }, []);
+
+  /** 进入文件夹失效状态：不再展示原始异常，保留文件夹名用于提示 */
+  const enterInvalid = useCallback((kind: FolderErrorKind, name: string) => {
+    clearThumbs();
+    setFolderError(kind);
+    setStatus('invalid');
+    setImages([]);
+    setHasSubfolders(false);
+    setWarningDismissed(false);
+    setCurrentIndex(0);
+    setRotation(0);
+    setNaturalSizes({});
+    setError('');
+    if (name) {
+      setDirName(name);
+      void markFolderInvalid(name, kind);
+    }
+  }, []);
+
+  /** 单张图片读取失败时探测目录，区分单文件问题与整目录失效 */
+  const onImageReadError = useCallback(
+    (_name: string, _error: unknown) => {
+      if (statusRef.current !== 'ready') return;
+      const handle = currentHandleRef.current;
+      if (!handle || probingRef.current) return;
+      const now = Date.now();
+      if (now - lastProbeRef.current < 1000) return;
+      lastProbeRef.current = now;
+      probingRef.current = true;
+      void probeDirectory(handle)
+        .then((result) => {
+          if (result === 'ok') return;
+          enterInvalid(result, handle.name);
+        })
+        .catch(() => {
+          /* 探测失败时保留图片占位，不打断阅读 */
+        })
+        .finally(() => {
+          probingRef.current = false;
+        });
+    },
+    [enterInvalid],
+  );
 
   const rotateBy = useCallback((delta: number) => {
     setRotation((r) => (((r + delta) % 360) + 360) % 360);
@@ -611,18 +663,31 @@ export default function App() {
   }, [status, images, dirVisible]);
 
   async function restoreDir(handle: FileSystemDirectoryHandle) {
-    const perm = await handle.queryPermission({ mode: 'read' });
-    if (perm === 'granted') {
-      await loadFromHandle(handle);
-    } else if (perm === 'prompt') {
+    try {
+      const perm = await handle.queryPermission({ mode: 'read' });
+      if (perm === 'granted') {
+        await loadFromHandle(handle);
+      } else if (perm === 'prompt') {
+        setStoredHandle(handle);
+        setReauthNeeded(true);
+      } else {
+        currentHandleRef.current = handle;
+        setStoredHandle(handle);
+        setReauthNeeded(false);
+        enterInvalid('permission', handle.name);
+      }
+    } catch (e) {
+      console.warn('Failed to restore folder', e);
+      currentHandleRef.current = handle;
       setStoredHandle(handle);
-      setReauthNeeded(true);
+      enterInvalid(classifyFolderError(e), handle.name);
     }
   }
 
   async function loadFromHandle(handle: FileSystemDirectoryHandle, pre?: ScanResult) {
     // 切换目录前先把上一个文件夹的阅读状态落盘
     flushPendingState();
+    currentHandleRef.current = handle;
     const seq = ++loadSeqRef.current;
     setStatus('loading');
     setError('');
@@ -648,6 +713,7 @@ export default function App() {
           : 0;
 
       clearThumbs();
+      setFolderError(null);
       setFolderSession((n) => n + 1);
       setImages(result.images);
       setHasSubfolders(result.hasSubfolders);
@@ -658,6 +724,7 @@ export default function App() {
       setRotation(0);
       setCurrentIndex(startIndex);
       setStatus('ready');
+      void clearFolderInvalid(handle.name);
 
       if (nextMode === 'scroll') {
         if (startIndex > 0) {
@@ -674,8 +741,8 @@ export default function App() {
         }, 60);
       }
     } catch (e) {
-      setStatus('error');
-      setError(String(e));
+      console.warn('Failed to load folder', e);
+      enterInvalid(classifyFolderError(e), handle.name);
     }
   }
 
@@ -688,18 +755,47 @@ export default function App() {
       await loadFromHandle(handle);
     } catch (e) {
       if (e instanceof DOMException && e.name === 'AbortError') return;
-      setStatus('error');
-      setError(String(e));
+      console.warn('Failed to pick folder', e);
+      setError(t(lang, 'folderUnknownDesc'));
     }
   }
 
   async function reauthorize() {
-    if (!storedHandle) return;
-    const perm = await storedHandle.requestPermission({ mode: 'read' });
-    if (perm === 'granted') {
-      setReauthNeeded(false);
-      await loadFromHandle(storedHandle);
+    const handle = storedHandle ?? currentHandleRef.current;
+    if (!handle) return;
+    try {
+      const perm = await handle.requestPermission({ mode: 'read' });
+      if (perm === 'granted') {
+        setReauthNeeded(false);
+        await loadFromHandle(handle);
+      } else {
+        enterInvalid('permission', handle.name);
+      }
+    } catch (e) {
+      console.warn('Failed to re-authorize folder', e);
+      enterInvalid(classifyFolderError(e), handle.name);
     }
+  }
+
+  /** 失效状态的「移除记录」：仅移除最近记录，不删除文件夹内的阅读记忆 */
+  async function removeCurrentRecord() {
+    const handle = currentHandleRef.current;
+    if (handle) {
+      try {
+        await removeDirFromHistory(handle);
+      } catch (e) {
+        console.warn('Failed to remove folder history', e);
+      }
+    }
+    if (dirName) await clearFolderInvalid(dirName);
+    currentHandleRef.current = null;
+    setFolderError(null);
+    setStatus('idle');
+    setImages([]);
+    setDirName('');
+    setError('');
+    setStoredHandle(null);
+    setReauthNeeded(false);
   }
 
   function onDragEnter(e: React.DragEvent) {
@@ -747,7 +843,10 @@ export default function App() {
       setReauthNeeded(false);
       await loadFromHandle(handle, result);
     } catch (err) {
-      setError(String(err));
+      console.warn('Failed to drop folder', err);
+      const kind = classifyFolderError(err);
+      if (kind === 'not-found' || kind === 'permission') enterInvalid(kind, handle.name);
+      else setError(t(lang, 'folderUnknownDesc'));
     }
   }
 
@@ -923,6 +1022,20 @@ export default function App() {
     MODES.findIndex((m) => m.key === mode),
     0,
   );
+
+  const canReauth = folderError === 'permission' && !!(storedHandle ?? currentHandleRef.current);
+  const invalidTitle =
+    folderError === 'permission'
+      ? t(lang, 'folderPermissionTitle')
+      : folderError === 'not-found'
+        ? t(lang, 'folderMissingTitle')
+        : t(lang, 'folderUnknownTitle');
+  const invalidDesc =
+    folderError === 'permission'
+      ? t(lang, 'folderPermissionDesc')
+      : folderError === 'not-found'
+        ? t(lang, 'folderMissingDesc')
+        : t(lang, 'folderUnknownDesc');
 
   // 旋转尺寸适配：单页 / 滚动用当前图片，双页按半宽分别计算
   const currentName = images[currentIndex]?.name ?? '';
@@ -1107,6 +1220,7 @@ export default function App() {
 
           {status === 'loading' && <p className="hint">{t(lang, 'loading')}</p>}
           {status === 'idle' && <p className="hint">{t(lang, 'importPrompt')}</p>}
+          {status === 'invalid' && <p className="hint">{t(lang, 'folderInvalidListHint')}</p>}
           {status === 'ready' && images.length === 0 && <p className="hint">{t(lang, 'noImages')}</p>}
           {status === 'ready' && images.length > 0 && filtered.length === 0 && (
             <p className="hint">{t(lang, 'searchEmpty')}</p>
@@ -1166,6 +1280,38 @@ export default function App() {
             </div>
           )}
 
+          {status === 'invalid' && (
+            <div className="empty">
+              <span className="empty__badge">
+                <Icon name="alert" size={24} />
+              </span>
+              <h2 className="empty__title">{invalidTitle}</h2>
+              <p className="empty__desc">{invalidDesc}</p>
+              {dirName && <p className="empty__hint">{dirName}</p>}
+              <div className="empty__actions">
+                {canReauth && (
+                  <button className="btn btn--primary btn--lg" onClick={() => void reauthorize()}>
+                    <Icon name="alert" size={16} />
+                    {t(lang, 'reauth')}
+                  </button>
+                )}
+                <button
+                  className={canReauth ? 'btn btn--lg' : 'btn btn--primary btn--lg'}
+                  onClick={importFolder}
+                >
+                  <Icon name="folderPlus" size={16} />
+                  {t(lang, 'reselectFolder')}
+                </button>
+                {folderError !== 'permission' && (
+                  <button className="btn btn--lg" onClick={() => void removeCurrentRecord()}>
+                    <Icon name="close" size={16} />
+                    {t(lang, 'removeRecord')}
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
           {status === 'ready' && images.length === 0 && (
             <div className="empty">
               <span className="empty__badge">
@@ -1218,6 +1364,8 @@ export default function App() {
               rotateBoxW={scrollBox?.w ?? 0}
               rotateBoxH={scrollBox?.h ?? 0}
               onSize={onImageSize}
+              onReadError={onImageReadError}
+              errorLabel={t(lang, 'imageReadFailed')}
             />
           )}
 
@@ -1259,6 +1407,8 @@ export default function App() {
                       fileHandle={images[currentIndex].fileHandle}
                       alt={images[currentIndex].name}
                       onSize={onImageSize}
+                      onReadError={onImageReadError}
+                      errorLabel={t(lang, 'imageReadFailed')}
                     />
                   </div>
                 </div>
@@ -1302,6 +1452,8 @@ export default function App() {
                             fileHandle={img.fileHandle}
                             alt={img.name}
                             onSize={onImageSize}
+                            onReadError={onImageReadError}
+                            errorLabel={t(lang, 'imageReadFailed')}
                           />
                         </div>
                       </div>

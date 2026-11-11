@@ -1,5 +1,6 @@
 // 阅读器配置：存取于 chrome.storage.sync；文件夹阅读状态存于 chrome.storage.local
 import type { LangSetting } from './i18n';
+import type { FolderErrorKind } from './folder-error';
 
 export type ReaderMode = 'scroll' | 'single' | 'double';
 export type Theme = 'light' | 'dark';
@@ -55,11 +56,19 @@ export interface FolderState {
 
 export type FolderStateMap = Record<string, FolderState>;
 
+export interface InvalidFolderInfo {
+  kind: FolderErrorKind;
+  at: number;
+}
+
+export type InvalidFolderMap = Record<string, InvalidFolderInfo>;
+
 const CONFIG_KEY = 'config';
 const LAST_ZOOM_KEY = 'lastZoom';
 /** 旧版位置键：仅读取迁移，不再写入 */
 const LEGACY_POS_KEY = 'lastPosition';
 const FOLDER_STATE_KEY = 'folderState';
+const INVALID_FOLDERS_KEY = 'invalidFolders';
 
 /**
  * 安全获取 storage 区域。
@@ -254,4 +263,114 @@ export async function saveFolderState(dir: string, patch: FolderState): Promise<
     }
   });
   await folderWrite;
+}
+
+/** 删除指定文件夹的阅读状态（F9 勾选「同时清除阅读记忆」时使用） */
+export async function clearFolderStates(names: string[]): Promise<void> {
+  if (names.length === 0) return;
+  const map = await getFolderStates();
+  let changed = false;
+  for (const name of names) {
+    if (name in map) {
+      delete map[name];
+      changed = true;
+    }
+  }
+  if (!changed) return;
+  const area = getStorageArea('local');
+  if (!area) return;
+  const snapshot = { ...map };
+  folderWrite = folderWrite.then(async () => {
+    try {
+      await area.set({ [FOLDER_STATE_KEY]: snapshot });
+    } catch {
+      /* ignore */
+    }
+  });
+  await folderWrite;
+}
+
+// 失效文件夹标记：reader 写入，popup 读取；与 folderState 一样存 local
+let invalidCache: InvalidFolderMap | undefined;
+let invalidPromise: Promise<InvalidFolderMap> | undefined;
+let invalidWrite: Promise<void> = Promise.resolve();
+
+async function readInvalidFolders(): Promise<InvalidFolderMap> {
+  const area = getStorageArea('local');
+  if (!area) return {};
+  try {
+    const stored = await area.get(INVALID_FOLDERS_KEY);
+    const raw = stored?.[INVALID_FOLDERS_KEY];
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+    const map: InvalidFolderMap = {};
+    for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
+      if (!value || typeof value !== 'object') continue;
+      const obj = value as Record<string, unknown>;
+      const kind = obj['kind'];
+      if (kind !== 'not-found' && kind !== 'permission' && kind !== 'unknown') continue;
+      const at = typeof obj['at'] === 'number' && Number.isFinite(obj['at']) ? obj['at'] : 0;
+      map[name] = { kind, at };
+    }
+    return map;
+  } catch {
+    return {};
+  }
+}
+
+async function getInvalidFolders(): Promise<InvalidFolderMap> {
+  if (invalidCache) return invalidCache;
+  if (!invalidPromise) invalidPromise = readInvalidFolders();
+  const map = await invalidPromise;
+  invalidCache = map;
+  invalidPromise = undefined;
+  return map;
+}
+
+async function writeInvalidFolders(map: InvalidFolderMap): Promise<void> {
+  const area = getStorageArea('local');
+  if (!area) return;
+  const snapshot = { ...map };
+  invalidWrite = invalidWrite.then(async () => {
+    try {
+      await area.set({ [INVALID_FOLDERS_KEY]: snapshot });
+    } catch {
+      /* ignore */
+    }
+  });
+  await invalidWrite;
+}
+
+export async function loadInvalidFolders(): Promise<InvalidFolderMap> {
+  return { ...(await getInvalidFolders()) };
+}
+
+export async function markFolderInvalid(dir: string, kind: FolderErrorKind): Promise<void> {
+  if (!dir) return;
+  const map = await getInvalidFolders();
+  map[dir] = { kind, at: Date.now() };
+  await writeInvalidFolders(map);
+}
+
+/** 清除指定文件夹或全部失效标记 */
+export async function clearInvalidFolders(names?: string[]): Promise<void> {
+  const map = await getInvalidFolders();
+  if (!names) {
+    if (Object.keys(map).length === 0) return;
+    invalidCache = {};
+    await writeInvalidFolders({});
+    return;
+  }
+  let changed = false;
+  for (const name of names) {
+    if (name in map) {
+      delete map[name];
+      changed = true;
+    }
+  }
+  if (changed) await writeInvalidFolders(map);
+}
+
+export async function clearFolderInvalid(dir: string): Promise<void> {
+  if (!dir) return;
+  await clearInvalidFolders([dir]);
 }
